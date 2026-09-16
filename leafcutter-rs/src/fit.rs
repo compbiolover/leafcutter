@@ -128,7 +128,13 @@ fn solve(mut a: Vec<f64>, mut b: Vec<f64>, p: usize, k: usize) -> Vec<f64> {
 /// regress `log((y+1) / rowSums(y+1))` on the design with a small ridge penalty and centre
 /// each row. Returns row-major `P x K`. Stan's `beta_scale`/`beta_raw` split of the same
 /// matrix is a pure reparameterisation, so the centred coefficients are the initial `beta`.
-pub fn smart_init(counts: &[u32], n: usize, k: usize, design: &Design, regularizer: f64) -> Vec<f64> {
+pub fn smart_init(
+    counts: &[u32],
+    n: usize,
+    k: usize,
+    design: &Design,
+    regularizer: f64,
+) -> Vec<f64> {
     let p = design.p;
     // X'X + reg I  and  X' y_norm
     let mut xtx = vec![0.0; p * p];
@@ -147,6 +153,52 @@ pub fn smart_init(counts: &[u32], n: usize, k: usize, design: &Design, regulariz
             }
             for j in 0..k {
                 xty[q * k + j] += x[q] * ynorm[j];
+            }
+        }
+    }
+    for q in 0..p {
+        xtx[q * p + q] += regularizer;
+    }
+    let mut beta = solve(xtx, xty, p, k);
+    center_rows(&mut beta, p, k);
+    beta
+}
+
+/// The same initialisation computed from the collapsed representation: `X'X` and
+/// `X' y_norm` are sums over samples that only depend on the design cell and the integer
+/// counts, so they can be accumulated from the histograms (samples with zero total contribute
+/// `-ln K` to every intron). Identical to [`smart_init`] up to floating point summation order.
+pub fn smart_init_collapsed(data: &ClusterData, regularizer: f64) -> Vec<f64> {
+    let (p, k) = (data.p, data.k);
+    let mut xtx = vec![0.0; p * p];
+    let mut xty = vec![0.0; p * k];
+    let lnk = (k as f64).ln();
+    let mut s = vec![0.0; k];
+    for cell in &data.cells {
+        let n_c = cell.n_pos + cell.n_zero;
+        if n_c == 0.0 {
+            continue;
+        }
+        // Σ_n y_norm_nj = Σ_n ln(y_nj + 1) - Σ_n ln(tot_n + K)
+        let mut log_tot = 0.0;
+        for &(v, m) in &cell.total_hist {
+            log_tot += m * ((v as f64) + k as f64).ln();
+        }
+        log_tot += cell.n_zero * lnk;
+        for (sj, hist) in s.iter_mut().zip(&cell.intron_hist) {
+            let mut acc = 0.0;
+            for &(v, m) in hist {
+                acc += m * ((v as f64) + 1.0).ln();
+            }
+            *sj = acc - log_tot;
+        }
+        let x = &cell.x;
+        for q in 0..p {
+            for r in 0..p {
+                xtx[q * p + r] += n_c * x[q] * x[r];
+            }
+            for j in 0..k {
+                xty[q * k + j] += x[q] * s[j];
             }
         }
     }
@@ -235,14 +287,14 @@ pub fn lrt(
     params: &FitParams,
     cached_null: Option<Fit>,
 ) -> LrtResult {
-    let x_null = x_full.select_columns(null_cols);
-    let data_null = ClusterData::build(counts, n, k, &x_null);
     let data_full = ClusterData::build(counts, n, k, x_full);
+    let data_null = data_full.select_columns(null_cols);
+    let p_null = null_cols.len();
 
     let mut fit_null = match cached_null {
-        Some(f) if f.p == x_null.p && f.k == k => f,
+        Some(f) if f.p == p_null && f.k == k => f,
         _ => {
-            let beta0 = smart_init(counts, n, k, &x_null, params.smart_init_regularizer);
+            let beta0 = smart_init_collapsed(&data_null, params.smart_init_regularizer);
             fit_model(&data_null, &beta0, &vec![params.init_conc; k], params)
         }
     };
@@ -263,7 +315,7 @@ pub fn lrt(
             .fold(0.0, f64::max);
         if params.restart_conc_ratio <= 1.0 || moved > params.restart_conc_ratio.ln() {
             // start 1: method-of-moments init of the full design, fresh concentrations
-            let beta_mm = smart_init(counts, n, k, x_full, params.smart_init_regularizer);
+            let beta_mm = smart_init_collapsed(&data_full, params.smart_init_regularizer);
             let alt = fit_model(&data_full, &beta_mm, &vec![params.init_conc; k], params);
             if alt.value > fit_full.value {
                 fit_full = alt;
@@ -278,11 +330,11 @@ pub fn lrt(
         }
     }
 
-    let df = (p_full - x_null.p) * (k - 1);
+    let df = (p_full - p_null) * (k - 1);
     let mut loglr = fit_full.value - fit_null.value;
     let mut refit = false;
     if chisq_sf(2.0 * loglr, df as f64) < params.refit_null_below_p {
-        let mut beta_n = vec![0.0; x_null.p * k];
+        let mut beta_n = vec![0.0; p_null * k];
         for (i, &c) in null_cols.iter().enumerate() {
             beta_n[i * k..(i + 1) * k].copy_from_slice(fit_full.beta_row(c));
         }
@@ -294,7 +346,14 @@ pub fn lrt(
         }
     }
     let p = chisq_sf(2.0 * loglr, df as f64);
-    LrtResult { loglr, df, p, fit_null, fit_full, refit_null: refit }
+    LrtResult {
+        loglr,
+        df,
+        p,
+        fit_null,
+        fit_full,
+        refit_null: refit,
+    }
 }
 
 /// Per-intron effect sizes (`leaf_cutter_effect_sizes`): the log effect size is the group
@@ -324,7 +383,12 @@ pub fn effect_sizes(fit: &Fit, intercept_row: usize, group_row: usize) -> Vec<Ef
     let base = to_psi(b0);
     let pert = to_psi(&(0..k).map(|j| b0[j] + b1[j]).collect::<Vec<_>>());
     (0..k)
-        .map(|j| EffectSize { logef: b1[j], baseline: base[j], perturbed: pert[j], deltapsi: pert[j] - base[j] })
+        .map(|j| EffectSize {
+            logef: b1[j],
+            baseline: base[j],
+            perturbed: pert[j],
+            deltapsi: pert[j] - base[j],
+        })
         .collect()
 }
 
@@ -343,6 +407,25 @@ mod tests {
         let r11 = x[1] + 3.0 * x[3];
         assert!((r00 - 1.0).abs() < 1e-12 && (r01 - 2.0).abs() < 1e-12);
         assert!((r10 - 3.0).abs() < 1e-12 && (r11 - 4.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn collapsed_smart_init_matches_dense() {
+        let n = 12;
+        let k = 3;
+        let counts: Vec<u32> = vec![
+            5, 3, 0, 0, 0, 0, 9, 1, 2, 4, 4, 4, 0, 7, 1, 30, 0, 2, 1, 1, 1, 0, 0, 0, 8, 2, 2, 5, 3,
+            0, 5, 3, 0, 6, 6, 1,
+        ];
+        let group: Vec<f64> = (0..n).map(|i| (i % 2) as f64).collect();
+        let cov: Vec<f64> = (0..n).map(|i| (i % 3) as f64 - 1.0).collect();
+        let x = Design::from_columns(n, &[&vec![1.0; n], &group, &cov]);
+        let dense = smart_init(&counts, n, k, &x, 0.001);
+        let data = ClusterData::build(&counts, n, k, &x);
+        let coll = smart_init_collapsed(&data, 0.001);
+        for (a, b) in dense.iter().zip(&coll) {
+            assert!((a - b).abs() < 1e-10, "{dense:?} vs {coll:?}");
+        }
     }
 
     #[test]
@@ -372,7 +455,11 @@ mod tests {
         let k = 3;
         let mut counts = Vec::new();
         for i in 0..n {
-            let base = if i < n / 2 { [30u32, 5, 5] } else { [5u32, 30, 5] };
+            let base = if i < n / 2 {
+                [30u32, 5, 5]
+            } else {
+                [5u32, 30, 5]
+            };
             for j in 0..k {
                 counts.push(base[j] + (i % 2) as u32);
             }

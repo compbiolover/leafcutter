@@ -51,7 +51,12 @@ fn cluster_key(prep: &PreparedCluster) -> u64 {
 impl NullCache {
     /// In-memory cache (not persisted).
     pub fn in_memory(cohort_key: u64) -> Self {
-        NullCache { path: None, cohort_key, entries: Mutex::new(HashMap::new()), dirty: Mutex::new(false) }
+        NullCache {
+            path: None,
+            cohort_key,
+            entries: Mutex::new(HashMap::new()),
+            dirty: Mutex::new(false),
+        }
     }
 
     /// Open (or create) a cache file. An existing file for a different cohort is ignored and
@@ -65,7 +70,12 @@ impl NullCache {
                 }
             }
         }
-        NullCache { path: Some(path.to_path_buf()), cohort_key, entries: Mutex::new(entries), dirty: Mutex::new(false) }
+        NullCache {
+            path: Some(path.to_path_buf()),
+            cohort_key,
+            entries: Mutex::new(entries),
+            dirty: Mutex::new(false),
+        }
     }
 
     pub fn len(&self) -> usize {
@@ -79,24 +89,37 @@ impl NullCache {
     pub fn get(&self, cluster: &str, prep: &PreparedCluster) -> Option<Fit> {
         let key = cluster_key(prep);
         let e = self.entries.lock().unwrap();
-        e.get(cluster).filter(|(k, _)| *k == key).map(|(_, f)| f.clone())
+        e.get(cluster)
+            .filter(|(k, _)| *k == key)
+            .map(|(_, f)| f.clone())
     }
 
     pub fn put(&self, cluster: &str, prep: &PreparedCluster, fit: &Fit) {
         let key = cluster_key(prep);
-        self.entries.lock().unwrap().insert(cluster.to_string(), (key, fit.clone()));
+        self.entries
+            .lock()
+            .unwrap()
+            .insert(cluster.to_string(), (key, fit.clone()));
         *self.dirty.lock().unwrap() = true;
     }
 
     /// Persist to disk (no-op for in-memory caches or when nothing changed).
     pub fn save(&self) -> std::io::Result<()> {
-        let Some(path) = &self.path else { return Ok(()) };
+        let Some(path) = &self.path else {
+            return Ok(());
+        };
         if !*self.dirty.lock().unwrap() {
             return Ok(());
         }
-        let cf = CacheFile { cohort_key: self.cohort_key, entries: self.entries.lock().unwrap().clone() };
+        let cf = CacheFile {
+            cohort_key: self.cohort_key,
+            entries: self.entries.lock().unwrap().clone(),
+        };
         let tmp = path.with_extension("tmp");
-        std::fs::write(&tmp, serde_json::to_vec(&cf).map_err(std::io::Error::other)?)?;
+        std::fs::write(
+            &tmp,
+            serde_json::to_vec(&cf).map_err(std::io::Error::other)?,
+        )?;
         std::fs::rename(&tmp, path)?;
         *self.dirty.lock().unwrap() = false;
         Ok(())

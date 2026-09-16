@@ -5,7 +5,14 @@
 //! uses): absolute / relative change in objective, gradient norm, relative gradient
 //! (`g' H g / |f|`) and parameter change.
 
-/// Optimiser settings. The defaults reproduce Stan's optimisation defaults.
+/// Optimiser settings.
+///
+/// Stan's defaults are `history = 5`, `tol_rel_obj = 1e4`, `tol_rel_grad = 1e7` (both scaled
+/// by machine epsilon). Those stop noticeably early in the flat concentration directions of
+/// this model (fits end up ~1e-2 below the optimum in log posterior), so the defaults here
+/// are tighter: `history = 10`, `tol_rel_obj = 1e2`, `tol_rel_grad = 1e4`, which brings the
+/// fits within ~1e-5 of the optimum at about twice the cost. Use [`LbfgsParams::stan`] for
+/// Stan's values.
 #[derive(Clone, Debug)]
 pub struct LbfgsParams {
     /// Number of correction pairs kept.
@@ -31,15 +38,27 @@ pub struct LbfgsParams {
 impl Default for LbfgsParams {
     fn default() -> Self {
         LbfgsParams {
-            history: 5,
+            history: 10,
             max_iter: 2000,
             tol_obj: 1e-12,
-            tol_rel_obj: 1e4,
+            tol_rel_obj: 1e2,
             tol_grad: 1e-8,
-            tol_rel_grad: 1e7,
+            tol_rel_grad: 1e4,
             tol_param: 1e-8,
             max_line_search: 40,
             trace: false,
+        }
+    }
+}
+
+impl LbfgsParams {
+    /// The stopping rules `rstan::optimizing` uses by default.
+    pub fn stan() -> Self {
+        LbfgsParams {
+            history: 5,
+            tol_rel_obj: 1e4,
+            tol_rel_grad: 1e7,
+            ..Default::default()
         }
     }
 }
@@ -85,7 +104,13 @@ where
     let mut evals = 1usize;
     let mut fx = f(x, &mut g);
     if !fx.is_finite() {
-        return LbfgsResult { f: fx, grad_norm: f64::NAN, iterations: 0, evaluations: evals, status: Status::NonFiniteStart };
+        return LbfgsResult {
+            f: fx,
+            grad_norm: f64::NAN,
+            iterations: 0,
+            evaluations: evals,
+            status: Status::NonFiniteStart,
+        };
     }
 
     let m = params.history.max(1);
@@ -155,11 +180,31 @@ where
         }
 
         // --- line search
-        let step0 = if iter == 0 { (1.0 / gnorm).min(1.0) } else { 1.0 };
-        let ls = line_search(&mut f, x, fx, &g, &d, dg, step0, &mut x_new, &mut g_new, params.max_line_search);
+        let step0 = if iter == 0 {
+            (1.0 / gnorm).min(1.0)
+        } else {
+            1.0
+        };
+        let ls = line_search(
+            &mut f,
+            x,
+            fx,
+            &g,
+            &d,
+            dg,
+            step0,
+            &mut x_new,
+            &mut g_new,
+            params.max_line_search,
+        );
         evals += ls.evals;
         if params.trace {
-            eprintln!("iter {iter:4} f={fx:.10} |g|={gnorm:.3e} gHg/|f|={:.3e} ls={:?} evals={}", (-dg) / fx.abs().max(eps), ls.result, ls.evals);
+            eprintln!(
+                "iter {iter:4} f={fx:.10} |g|={gnorm:.3e} gHg/|f|={:.3e} ls={:?} evals={}",
+                (-dg) / fx.abs().max(eps),
+                ls.result,
+                ls.evals
+            );
         }
         let Some((step, f_new)) = ls.result else {
             status = Status::LineSearchFailed;
@@ -208,7 +253,13 @@ where
         }
     }
 
-    LbfgsResult { f: fx, grad_norm: dot(&g, &g).sqrt(), iterations: iter, evaluations: evals, status }
+    LbfgsResult {
+        f: fx,
+        grad_norm: dot(&g, &g).sqrt(),
+        iterations: iter,
+        evaluations: evals,
+        status,
+    }
 }
 
 struct LineSearchOutcome {
@@ -239,15 +290,20 @@ where
 {
     let n = x.len();
     let mut evals = 0usize;
-    let mut eval_at = |a: f64, x_new: &mut [f64], g_new: &mut [f64], evals: &mut usize| -> (f64, f64) {
-        for j in 0..n {
-            x_new[j] = x[j] + a * d[j];
-        }
-        *evals += 1;
-        let fa = f(x_new, g_new);
-        let dga = if fa.is_finite() { dot(g_new, d) } else { f64::NAN };
-        (fa, dga)
-    };
+    let mut eval_at =
+        |a: f64, x_new: &mut [f64], g_new: &mut [f64], evals: &mut usize| -> (f64, f64) {
+            for j in 0..n {
+                x_new[j] = x[j] + a * d[j];
+            }
+            *evals += 1;
+            let fa = f(x_new, g_new);
+            let dga = if fa.is_finite() {
+                dot(g_new, d)
+            } else {
+                f64::NAN
+            };
+            (fa, dga)
+        };
 
     // Bracketing phase.
     let mut a_prev = 0.0;
@@ -263,7 +319,10 @@ where
             break;
         }
         if dga.abs() <= -C2 * dg0 {
-            return LineSearchOutcome { result: Some((a, fa)), evals };
+            return LineSearchOutcome {
+                result: Some((a, fa)),
+                evals,
+            };
         }
         if dga >= 0.0 {
             bracket = Some((a, fa, dga, a_prev, f_prev, dg_prev));
@@ -278,7 +337,10 @@ where
         }
     }
     let Some((mut lo, mut f_lo, mut dg_lo, mut hi, mut f_hi, mut dg_hi)) = bracket else {
-        return LineSearchOutcome { result: None, evals };
+        return LineSearchOutcome {
+            result: None,
+            evals,
+        };
     };
 
     // Zoom phase.
@@ -300,7 +362,10 @@ where
             dg_hi = dgj;
         } else {
             if dgj.abs() <= -C2 * dg0 {
-                return LineSearchOutcome { result: Some((a_j, fj)), evals };
+                return LineSearchOutcome {
+                    result: Some((a_j, fj)),
+                    evals,
+                };
             }
             if dgj * (hi - lo) >= 0.0 {
                 hi = lo;
@@ -316,10 +381,16 @@ where
     if lo > 0.0 && f_lo.is_finite() && f_lo < f0 {
         let (fa, _) = eval_at(lo, x_new, g_new, &mut evals);
         if fa.is_finite() && fa < f0 {
-            return LineSearchOutcome { result: Some((lo, fa)), evals };
+            return LineSearchOutcome {
+                result: Some((lo, fa)),
+                evals,
+            };
         }
     }
-    LineSearchOutcome { result: None, evals }
+    LineSearchOutcome {
+        result: None,
+        evals,
+    }
 }
 
 /// Minimiser of the cubic interpolating (a, fa, ga) and (b, fb, gb).

@@ -10,7 +10,7 @@
 //! * [`special`]  – lgamma / digamma / chi-square survival function.
 //! * [`lbfgs`]    – a small L-BFGS minimiser with a strong-Wolfe line search.
 //! * [`dm`]       – the Dirichlet-multinomial GLM objective and analytic gradient over
-//!                  design cells (sufficient-statistic collapse).
+//!   design cells (sufficient-statistic collapse).
 //! * [`fit`]      – smart initialisation, null/full fits, likelihood ratio test, effect sizes.
 //! * [`ds`]       – filtering, per-cluster driver, parallel loop, BH / Storey q-values.
 //! * [`io`]       – LeafCutter counts / groups files and result tables.

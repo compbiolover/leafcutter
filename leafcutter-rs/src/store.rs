@@ -50,10 +50,18 @@ pub fn write_store(samples: &[String], clusters: &[Cluster], out: &Path) -> std:
     for c in clusters {
         let max = c.counts.iter().copied().max().unwrap_or(0);
         let width: u8 = if max <= u16::MAX as u32 { 2 } else { 4 };
-        metas.push(ClusterMeta { name: c.name.clone(), introns: c.introns.clone(), offset, width });
+        metas.push(ClusterMeta {
+            name: c.name.clone(),
+            introns: c.introns.clone(),
+            offset,
+            width,
+        });
         offset += (c.counts.len() * width as usize) as u64;
     }
-    let header = serde_json::to_vec(&StoreHeader { samples: samples.to_vec(), clusters: metas.clone() })?;
+    let header = serde_json::to_vec(&StoreHeader {
+        samples: samples.to_vec(),
+        clusters: metas.clone(),
+    })?;
     let mut w = BufWriter::with_capacity(1 << 20, File::create(out)?);
     w.write_all(MAGIC)?;
     w.write_all(&VERSION.to_le_bytes())?;
@@ -88,7 +96,8 @@ pub struct Store {
 
 impl Store {
     pub fn open(path: &Path) -> Result<Store, String> {
-        let file = File::open(path).map_err(|e| format!("cannot open store {}: {e}", path.display()))?;
+        let file =
+            File::open(path).map_err(|e| format!("cannot open store {}: {e}", path.display()))?;
         // SAFETY: the store is treated as read-only; concurrent modification of the file is
         // outside this program's control, as for any mmap.
         let mmap = unsafe { Mmap::map(&file) }.map_err(|e| e.to_string())?;
@@ -100,8 +109,13 @@ impl Store {
             return Err(format!("unsupported store version {version}"));
         }
         let hlen = u64::from_le_bytes(mmap[8..16].try_into().unwrap()) as usize;
-        let header: StoreHeader = serde_json::from_slice(&mmap[16..16 + hlen]).map_err(|e| e.to_string())?;
-        Ok(Store { mmap, data_start: 16 + hlen, header })
+        let header: StoreHeader =
+            serde_json::from_slice(&mmap[16..16 + hlen]).map_err(|e| e.to_string())?;
+        Ok(Store {
+            mmap,
+            data_start: 16 + hlen,
+            header,
+        })
     }
 
     pub fn n_samples(&self) -> usize {
@@ -124,11 +138,22 @@ impl Store {
         for &s in sample_idx {
             let row = &block[s * k * w..(s + 1) * k * w];
             match w {
-                2 => counts.extend(row.chunks_exact(2).map(|b| u16::from_le_bytes([b[0], b[1]]) as u32)),
-                _ => counts.extend(row.chunks_exact(4).map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))),
+                2 => counts.extend(
+                    row.chunks_exact(2)
+                        .map(|b| u16::from_le_bytes([b[0], b[1]]) as u32),
+                ),
+                _ => counts.extend(
+                    row.chunks_exact(4)
+                        .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]])),
+                ),
             }
         }
-        Cluster { name: m.name.clone(), introns: m.introns.clone(), n: sample_idx.len(), counts }
+        Cluster {
+            name: m.name.clone(),
+            introns: m.introns.clone(),
+            n: sample_idx.len(),
+            counts,
+        }
     }
 }
 
@@ -140,8 +165,18 @@ mod tests {
     fn roundtrip() {
         let samples: Vec<String> = (0..5).map(|i| format!("s{i}")).collect();
         let clusters = vec![
-            Cluster { name: "c1".into(), introns: vec!["a".into(), "b".into()], n: 5, counts: (0..10).collect() },
-            Cluster { name: "c2".into(), introns: vec!["c".into(), "d".into(), "e".into()], n: 5, counts: (0..15).map(|v| v * 10000).collect() },
+            Cluster {
+                name: "c1".into(),
+                introns: vec!["a".into(), "b".into()],
+                n: 5,
+                counts: (0..10).collect(),
+            },
+            Cluster {
+                name: "c2".into(),
+                introns: vec!["c".into(), "d".into(), "e".into()],
+                n: 5,
+                counts: (0..15).map(|v| v * 10000).collect(),
+            },
         ];
         let dir = std::env::temp_dir().join(format!("lcstore_{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

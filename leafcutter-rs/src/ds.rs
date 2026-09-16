@@ -136,7 +136,12 @@ pub struct PreparedCluster {
 
 /// Apply the R package's filters. `x` is the 0/1 group vector over the request samples and
 /// `confounders` an optional `N x C` matrix. Returns the prepared cluster or a skip reason.
-pub fn prepare_cluster(cluster: &Cluster, x: &[f64], confounders: Option<&Design>, params: &DsParams) -> Result<PreparedCluster, String> {
+pub fn prepare_cluster(
+    cluster: &Cluster,
+    x: &[f64],
+    confounders: Option<&Design>,
+    params: &DsParams,
+) -> Result<PreparedCluster, String> {
     let k = cluster.k();
     let n = cluster.n;
     assert_eq!(x.len(), n);
@@ -146,18 +151,36 @@ pub fn prepare_cluster(cluster: &Cluster, x: &[f64], confounders: Option<&Design
     if k <= 1 {
         return Err("<=1 junction in cluster".into());
     }
-    let totals: Vec<u32> = (0..n).map(|i| cluster.counts[i * k..(i + 1) * k].iter().sum()).collect();
+    // one pass: per-sample totals and per-intron number of samples with a read
+    let mut totals: Vec<u32> = Vec::with_capacity(n);
+    let mut used_by = vec![0usize; k];
+    for i in 0..n {
+        let y = &cluster.counts[i * k..(i + 1) * k];
+        let mut tot = 0u32;
+        for j in 0..k {
+            if y[j] > 0 {
+                used_by[j] += 1;
+                tot += y[j];
+            }
+        }
+        totals.push(tot);
+    }
     let samples_used: Vec<usize> = (0..n).filter(|&i| totals[i] > 0).collect();
     if samples_used.len() <= 1 {
         return Err("<=1 sample with coverage>0".into());
     }
-    let covered: Vec<bool> = samples_used.iter().map(|&i| totals[i] >= params.min_coverage).collect();
+    let covered: Vec<bool> = samples_used
+        .iter()
+        .map(|&i| totals[i] >= params.min_coverage)
+        .collect();
     if covered.iter().filter(|&&c| c).count() <= 1 {
         return Err("<=1 sample with coverage>min_coverage".into());
     }
     let x_subset: Vec<f64> = samples_used.iter().map(|&i| x[i]).collect();
+    // (samples with zero total have no reads in any intron, so counting over all samples is
+    // the same as counting over samples_used)
     let introns_to_use: Vec<usize> = (0..k)
-        .filter(|&j| samples_used.iter().filter(|&&i| cluster.counts[i * k + j] > 0).count() >= params.min_samples_per_intron)
+        .filter(|&j| used_by[j] >= params.min_samples_per_intron)
         .collect();
     if introns_to_use.len() < 2 {
         return Err("<2 introns used in >=min_samples_per_intron samples".into());
@@ -173,7 +196,12 @@ pub fn prepare_cluster(cluster: &Cluster, x: &[f64], confounders: Option<&Design
             None => groups.push((xi, 1)),
         }
     }
-    if groups.iter().filter(|(_, c)| *c >= params.min_samples_per_group).count() < 2 {
+    if groups
+        .iter()
+        .filter(|(_, c)| *c >= params.min_samples_per_group)
+        .count()
+        < 2
+    {
         return Err("Not enough valid samples".into());
     }
     let k2 = introns_to_use.len();
@@ -198,7 +226,10 @@ pub fn prepare_cluster(cluster: &Cluster, x: &[f64], confounders: Option<&Design
     let x_full = Design::from_columns(n2, &col_refs);
     let null_cols: Vec<usize> = (0..x_full.p).filter(|&c| c != 1).collect();
     Ok(PreparedCluster {
-        introns: introns_to_use.iter().map(|&j| cluster.introns[j].clone()).collect(),
+        introns: introns_to_use
+            .iter()
+            .map(|&j| cluster.introns[j].clone())
+            .collect(),
         n: n2,
         k: k2,
         counts,
@@ -209,20 +240,35 @@ pub fn prepare_cluster(cluster: &Cluster, x: &[f64], confounders: Option<&Design
 }
 
 /// Test a single cluster: filter, fit, LRT, effect sizes.
-pub fn test_cluster(cluster: &Cluster, x: &[f64], confounders: Option<&Design>, params: &DsParams, null_cache: Option<&NullCache>) -> ClusterResult {
+pub fn test_cluster(
+    cluster: &Cluster,
+    x: &[f64],
+    confounders: Option<&Design>,
+    params: &DsParams,
+    null_cache: Option<&NullCache>,
+) -> ClusterResult {
     let prep = match prepare_cluster(cluster, x, confounders, params) {
         Ok(p) => p,
         Err(why) => return ClusterResult::skipped(&cluster.name, &why),
     };
     let cached: Option<Fit> = null_cache.and_then(|c| c.get(&cluster.name, &prep));
     let from_cache = cached.is_some();
-    let res = lrt(&prep.counts, prep.n, prep.k, &prep.x_full, &prep.null_cols, &params.fit, cached.clone());
+    let res = lrt(
+        &prep.counts,
+        prep.n,
+        prep.k,
+        &prep.x_full,
+        &prep.null_cols,
+        &params.fit,
+        cached.clone(),
+    );
     if cached.is_none() {
         if let Some(c) = null_cache {
             c.put(&cluster.name, &prep, &res.fit_null);
         }
     }
-    if !res.loglr.is_finite() || !res.fit_full.value.is_finite() || !res.fit_null.value.is_finite() {
+    if !res.loglr.is_finite() || !res.fit_full.value.is_finite() || !res.fit_null.value.is_finite()
+    {
         return ClusterResult::skipped(&cluster.name, "Error: non-finite fit");
     }
     let es = effect_sizes(&res.fit_full, 0, 1);
@@ -238,11 +284,22 @@ pub fn test_cluster(cluster: &Cluster, x: &[f64], confounders: Option<&Design>, 
             .introns
             .iter()
             .zip(es)
-            .map(|(name, e)| IntronResult { intron: name.clone(), logef: e.logef, baseline: e.baseline, perturbed: e.perturbed, deltapsi: e.deltapsi })
+            .map(|(name, e)| IntronResult {
+                intron: name.clone(),
+                logef: e.logef,
+                baseline: e.baseline,
+                perturbed: e.perturbed,
+                deltapsi: e.deltapsi,
+            })
             .collect(),
         n_samples: prep.n,
         refit_null: res.refit_null,
-        evaluations: res.fit_full.evaluations + if from_cache { 0 } else { res.fit_null.evaluations },
+        evaluations: res.fit_full.evaluations
+            + if from_cache {
+                0
+            } else {
+                res.fit_null.evaluations
+            },
         value_null: res.fit_null.value,
         value_full: res.fit_full.value,
         converged: res.fit_null.converged && res.fit_full.converged,
@@ -258,7 +315,11 @@ pub fn bh_adjust(p: &[Option<f64>]) -> Vec<Option<f64>> {
     if m == 0 {
         return out;
     }
-    idx.sort_by(|&a, &b| p[b].unwrap().partial_cmp(&p[a].unwrap()).unwrap_or(std::cmp::Ordering::Equal));
+    idx.sort_by(|&a, &b| {
+        p[b].unwrap()
+            .partial_cmp(&p[a].unwrap())
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     // descending p: q_(i) = min(1, cummin(m/i * p_(i)))
     let mut running = 1.0f64;
     for (pos, &i) in idx.iter().enumerate() {
@@ -277,14 +338,26 @@ pub fn storey_qvalues(p: &[Option<f64>], lambda: f64) -> Vec<Option<f64>> {
     if m == 0 {
         return vec![None; p.len()];
     }
-    let above = p.iter().filter(|v| matches!(v, Some(x) if *x > lambda)).count();
+    let above = p
+        .iter()
+        .filter(|v| matches!(v, Some(x) if *x > lambda))
+        .count();
     let pi0 = (above as f64 / ((1.0 - lambda) * m as f64)).clamp(0.0, 1.0);
     let pi0 = if pi0 == 0.0 { 1.0 / m as f64 } else { pi0 };
-    bh_adjust(p).into_iter().map(|q| q.map(|v| (v * pi0).min(1.0))).collect()
+    bh_adjust(p)
+        .into_iter()
+        .map(|q| q.map(|v| (v * pi0).min(1.0)))
+        .collect()
 }
 
 /// Run the test over all clusters in parallel (rayon) and fill in the adjusted p-values.
-pub fn run(clusters: &[Cluster], x: &[f64], confounders: Option<&Design>, params: &DsParams, null_cache: Option<&NullCache>) -> Vec<ClusterResult> {
+pub fn run(
+    clusters: &[Cluster],
+    x: &[f64],
+    confounders: Option<&Design>,
+    params: &DsParams,
+    null_cache: Option<&NullCache>,
+) -> Vec<ClusterResult> {
     let mut results: Vec<ClusterResult> = clusters
         .par_iter()
         .map(|c| test_cluster(c, x, confounders, params, null_cache))
@@ -324,9 +397,23 @@ mod tests {
     #[test]
     fn bh_matches_r() {
         // R: p.adjust(c(0.01, 0.04, 0.03, 0.5, NA, 0.2), method="fdr")
-        let p = [Some(0.01), Some(0.04), Some(0.03), Some(0.5), None, Some(0.2)];
+        let p = [
+            Some(0.01),
+            Some(0.04),
+            Some(0.03),
+            Some(0.5),
+            None,
+            Some(0.2),
+        ];
         let q = bh_adjust(&p);
-        let expect = [0.05, 0.06666666666666667, 0.06666666666666667, 0.5, f64::NAN, 0.25];
+        let expect = [
+            0.05,
+            0.06666666666666667,
+            0.06666666666666667,
+            0.5,
+            f64::NAN,
+            0.25,
+        ];
         for i in 0..p.len() {
             match (q[i], expect[i]) {
                 (None, e) => assert!(e.is_nan()),
@@ -341,14 +428,38 @@ mod tests {
         let n = 12;
         let x: Vec<f64> = (0..n).map(|i| if i < 6 { 0.0 } else { 1.0 }).collect();
         // single junction
-        let c = Cluster { name: "a".into(), introns: vec!["i1".into()], n, counts: vec![5; n] };
-        assert_eq!(prepare_cluster(&c, &x, None, &params).unwrap_err(), "<=1 junction in cluster");
+        let c = Cluster {
+            name: "a".into(),
+            introns: vec!["i1".into()],
+            n,
+            counts: vec![5; n],
+        };
+        assert_eq!(
+            prepare_cluster(&c, &x, None, &params).unwrap_err(),
+            "<=1 junction in cluster"
+        );
         // too many introns
-        let c = Cluster { name: "a".into(), introns: (0..11).map(|i| format!("i{i}")).collect(), n, counts: vec![5; n * 11] };
-        assert_eq!(prepare_cluster(&c, &x, None, &params).unwrap_err(), "Too many introns in cluster");
+        let c = Cluster {
+            name: "a".into(),
+            introns: (0..11).map(|i| format!("i{i}")).collect(),
+            n,
+            counts: vec![5; n * 11],
+        };
+        assert_eq!(
+            prepare_cluster(&c, &x, None, &params).unwrap_err(),
+            "Too many introns in cluster"
+        );
         // low coverage everywhere
-        let c = Cluster { name: "a".into(), introns: vec!["i1".into(), "i2".into()], n, counts: vec![1; n * 2] };
-        assert_eq!(prepare_cluster(&c, &x, None, &params).unwrap_err(), "<=1 sample with coverage>min_coverage");
+        let c = Cluster {
+            name: "a".into(),
+            introns: vec!["i1".into(), "i2".into()],
+            n,
+            counts: vec![1; n * 2],
+        };
+        assert_eq!(
+            prepare_cluster(&c, &x, None, &params).unwrap_err(),
+            "<=1 sample with coverage>min_coverage"
+        );
         // second intron rarely used
         let mut counts = vec![0u32; n * 2];
         for i in 0..n {
@@ -357,20 +468,44 @@ mod tests {
                 counts[i * 2 + 1] = 4;
             }
         }
-        let c = Cluster { name: "a".into(), introns: vec!["i1".into(), "i2".into()], n, counts };
-        assert_eq!(prepare_cluster(&c, &x, None, &params).unwrap_err(), "<2 introns used in >=min_samples_per_intron samples");
+        let c = Cluster {
+            name: "a".into(),
+            introns: vec!["i1".into(), "i2".into()],
+            n,
+            counts,
+        };
+        assert_eq!(
+            prepare_cluster(&c, &x, None, &params).unwrap_err(),
+            "<2 introns used in >=min_samples_per_intron samples"
+        );
         // one group under-covered
         let mut counts = vec![0u32; n * 2];
         for i in 0..n {
             counts[i * 2] = if i < 6 { 30 } else { 5 };
             counts[i * 2 + 1] = 5;
         }
-        let c = Cluster { name: "a".into(), introns: vec!["i1".into(), "i2".into()], n, counts };
-        assert_eq!(prepare_cluster(&c, &x, None, &params).unwrap_err(), "Not enough valid samples");
+        let c = Cluster {
+            name: "a".into(),
+            introns: vec!["i1".into(), "i2".into()],
+            n,
+            counts,
+        };
+        assert_eq!(
+            prepare_cluster(&c, &x, None, &params).unwrap_err(),
+            "Not enough valid samples"
+        );
         // success, with a constant confounder column dropped
         let counts: Vec<u32> = (0..n).flat_map(|i| [30 + i as u32, 10]).collect();
-        let c = Cluster { name: "a".into(), introns: vec!["i1".into(), "i2".into()], n, counts };
-        let conf = Design::from_columns(n, &[&vec![1.0; n], &(0..n).map(|i| i as f64).collect::<Vec<_>>()]);
+        let c = Cluster {
+            name: "a".into(),
+            introns: vec!["i1".into(), "i2".into()],
+            n,
+            counts,
+        };
+        let conf = Design::from_columns(
+            n,
+            &[&vec![1.0; n], &(0..n).map(|i| i as f64).collect::<Vec<_>>()],
+        );
         let prep = prepare_cluster(&c, &x, Some(&conf), &params).unwrap();
         assert_eq!(prep.x_full.p, 3);
         assert_eq!(prep.null_cols, vec![0, 2]);

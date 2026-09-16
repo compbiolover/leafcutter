@@ -2,7 +2,7 @@
 //!
 //! * `run`         – the `scripts/leafcutter_ds.R` workflow on a counts file or a count store.
 //! * `json`        – one request on stdin, one response on stdout (for use as a Node child
-//!                   process, e.g. from ProteinPaint).
+//!   process, e.g. from ProteinPaint).
 //! * `build-store` – convert a counts file into a memory-mapped cluster-major store.
 //! * `simulate`    – write a synthetic dataset for testing and benchmarking.
 
@@ -20,7 +20,11 @@ use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 #[derive(Parser)]
-#[command(name = "leafcutter_ds", version, about = "LeafCutter differential splicing (Rust port)")]
+#[command(
+    name = "leafcutter_ds",
+    version,
+    about = "LeafCutter differential splicing (Rust port)"
+)]
 struct Cli {
     #[command(subcommand)]
     cmd: Cmd,
@@ -86,14 +90,39 @@ struct FilterArgs {
     /// null and full fits (1 = always).
     #[arg(long, default_value_t = 1.0)]
     restart_conc_ratio: f64,
+    /// L-BFGS relative gradient tolerance (multiplied by machine epsilon; Stan's default 1e7).
+    #[arg(long, default_value_t = 1e4)]
+    tol_rel_grad: f64,
+    /// L-BFGS relative objective tolerance (multiplied by machine epsilon; Stan's default 1e4).
+    #[arg(long, default_value_t = 1e2)]
+    tol_rel_obj: f64,
+    /// L-BFGS history size (Stan's default 5).
+    #[arg(long, default_value_t = 10)]
+    history: usize,
+    /// Reproduce R/rstan's procedure exactly: Stan's stopping rules and a single start.
+    #[arg(long)]
+    like_r: bool,
 }
 
 impl FilterArgs {
     fn to_params(&self) -> DsParams {
-        let mut p = DsParams { max_cluster_size: self.max_cluster_size, min_samples_per_intron: self.min_samples_per_intron, min_samples_per_group: self.min_samples_per_group, min_coverage: self.min_coverage, ..Default::default() };
+        let mut p = DsParams {
+            max_cluster_size: self.max_cluster_size,
+            min_samples_per_intron: self.min_samples_per_intron,
+            min_samples_per_group: self.min_samples_per_group,
+            min_coverage: self.min_coverage,
+            ..Default::default()
+        };
         p.fit.max_iter = self.max_iter;
         p.fit.full_extra_starts = self.full_extra_starts;
         p.fit.restart_conc_ratio = self.restart_conc_ratio;
+        p.fit.lbfgs.tol_rel_grad = self.tol_rel_grad;
+        p.fit.lbfgs.tol_rel_obj = self.tol_rel_obj;
+        p.fit.lbfgs.history = self.history;
+        if self.like_r {
+            p.fit.lbfgs = leafcutter_rs::lbfgs::LbfgsParams::stan();
+            p.fit.full_extra_starts = 0;
+        }
         p
     }
 }
@@ -174,7 +203,10 @@ struct ErrorResponse {
 
 fn init_threads(threads: usize) {
     if threads > 0 {
-        rayon::ThreadPoolBuilder::new().num_threads(threads).build_global().ok();
+        rayon::ThreadPoolBuilder::new()
+            .num_threads(threads)
+            .build_global()
+            .ok();
     }
 }
 
@@ -187,7 +219,10 @@ enum Source {
 impl Source {
     fn open(path: &Path) -> Result<Source, String> {
         let mut magic = [0u8; 4];
-        let is_store = std::fs::File::open(path).and_then(|mut f| f.read_exact(&mut magic)).map(|_| &magic == b"LCCS").unwrap_or(false);
+        let is_store = std::fs::File::open(path)
+            .and_then(|mut f| f.read_exact(&mut magic))
+            .map(|_| &magic == b"LCCS")
+            .unwrap_or(false);
         if is_store {
             Store::open(path).map(Source::Store)
         } else {
@@ -217,21 +252,43 @@ struct Analysis {
     timing: BTreeMap<String, u128>,
 }
 
-fn analyse(source: &Source, meta: &io::Meta, params: &DsParams, null_cache_path: Option<&Path>) -> Result<Analysis, String> {
+fn analyse(
+    source: &Source,
+    meta: &io::Meta,
+    params: &DsParams,
+    null_cache_path: Option<&Path>,
+) -> Result<Analysis, String> {
     let mut timing = BTreeMap::new();
     let t0 = Instant::now();
     let enc = io::encode_design(&meta.groups, &meta.confounders)?;
     let cols = io::sample_indices(source.samples(), &meta.samples)?;
     let n = cols.len();
-    let min_group = enc.x.iter().filter(|&&v| v == 0.0).count().min(enc.x.iter().filter(|&&v| v == 1.0).count());
-    if min_group < params.min_samples_per_intron.max(params.min_samples_per_group) {
+    let min_group = enc
+        .x
+        .iter()
+        .filter(|&&v| v == 0.0)
+        .count()
+        .min(enc.x.iter().filter(|&&v| v == 1.0).count());
+    if min_group
+        < params
+            .min_samples_per_intron
+            .max(params.min_samples_per_group)
+    {
         return Err(format!(
             "the smallest group has {min_group} samples, fewer than min_samples_per_intron ({}) / min_samples_per_group ({}): no cluster is testable",
             params.min_samples_per_intron, params.min_samples_per_group
         ));
     }
     let cache = null_cache_path.map(|p| {
-        let key = fingerprint(&(&meta.samples, &meta.confounders, params.max_cluster_size, params.min_samples_per_intron, params.min_coverage, params.fit.conc_shape.to_bits(), params.fit.conc_rate.to_bits()));
+        let key = fingerprint(&(
+            &meta.samples,
+            &meta.confounders,
+            params.max_cluster_size,
+            params.min_samples_per_intron,
+            params.min_coverage,
+            params.fit.conc_shape.to_bits(),
+            params.fit.conc_rate.to_bits(),
+        ));
         NullCache::open(p, key)
     });
     let confounders: Option<&Design> = enc.confounders.as_ref();
@@ -261,10 +318,18 @@ fn analyse(source: &Source, meta: &io::Meta, params: &DsParams, null_cache_path:
         }
     };
     if let Some(c) = &cache {
-        c.save().map_err(|e| format!("cannot save null cache: {e}"))?;
+        c.save()
+            .map_err(|e| format!("cannot save null cache: {e}"))?;
     }
     timing.insert("total_ms".into(), t0.elapsed().as_millis());
-    Ok(Analysis { n_clusters: results.len(), results, group_names: enc.group_names, confounder_names: enc.confounder_names, n_samples: n, timing })
+    Ok(Analysis {
+        n_clusters: results.len(),
+        results,
+        group_names: enc.group_names,
+        confounder_names: enc.confounder_names,
+        n_samples: n,
+        timing,
+    })
 }
 
 fn summary(results: &[ClusterResult]) -> BTreeMap<String, usize> {
@@ -279,7 +344,10 @@ fn cmd_run(a: RunArgs) -> Result<(), String> {
     eprintln!("Loading metadata from {}", a.groups.display());
     let meta = io::read_groups(&a.groups)?;
     let enc = io::encode_design(&meta.groups, &meta.confounders)?;
-    eprintln!("Encoding as {} =0, {} =1", enc.group_names[0], enc.group_names[1]);
+    eprintln!(
+        "Encoding as {} =0, {} =1",
+        enc.group_names[0], enc.group_names[1]
+    );
     eprintln!("Running differential splicing analysis on {} samples, up to {} clusters/introns, {} threads...", meta.samples.len(), source.n_clusters(), rayon::current_num_threads());
     let an = analyse(&source, &meta, &params, a.null_cache.as_deref())?;
     eprintln!("Differential splicing summary:");
@@ -292,9 +360,18 @@ fn cmd_run(a: RunArgs) -> Result<(), String> {
     io::write_cluster_table(&sig, &an.results).map_err(|e| e.to_string())?;
     io::write_effect_sizes(&eff, &an.results, &an.group_names).map_err(|e| e.to_string())?;
     if a.json {
-        let resp = Response { group_names: an.group_names.clone(), n_samples: an.n_samples, n_clusters: an.n_clusters, confounder_columns: an.confounder_names.clone(), summary: summary(&an.results), timing_ms: an.timing.clone(), clusters: an.results };
+        let resp = Response {
+            group_names: an.group_names.clone(),
+            n_samples: an.n_samples,
+            n_clusters: an.n_clusters,
+            confounder_columns: an.confounder_names.clone(),
+            summary: summary(&an.results),
+            timing_ms: an.timing.clone(),
+            clusters: an.results,
+        };
         let path = format!("{}_results.json", a.output_prefix);
-        std::fs::write(&path, serde_json::to_vec(&resp).map_err(|e| e.to_string())?).map_err(|e| e.to_string())?;
+        std::fs::write(&path, serde_json::to_vec(&resp).map_err(|e| e.to_string())?)
+            .map_err(|e| e.to_string())?;
     }
     eprintln!("Wrote {} and {}", sig.display(), eff.display());
     Ok(())
@@ -302,10 +379,16 @@ fn cmd_run(a: RunArgs) -> Result<(), String> {
 
 fn cmd_json(default_threads: usize) -> Result<(), String> {
     let mut input = String::new();
-    std::io::stdin().read_to_string(&mut input).map_err(|e| e.to_string())?;
+    std::io::stdin()
+        .read_to_string(&mut input)
+        .map_err(|e| e.to_string())?;
     let req: Request = serde_json::from_str(&input).map_err(|e| format!("invalid request: {e}"))?;
     init_threads(req.threads.unwrap_or(default_threads));
-    let path = req.counts_file.as_ref().or(req.store.as_ref()).ok_or("request needs counts_file or store")?;
+    let path = req
+        .counts_file
+        .as_ref()
+        .or(req.store.as_ref())
+        .ok_or("request needs counts_file or store")?;
     let source = Source::open(path)?;
     let meta = match &req.groups_file {
         Some(g) => io::read_groups(g)?,
@@ -315,10 +398,18 @@ fn cmd_json(default_threads: usize) -> Result<(), String> {
             }
             for (i, c) in req.confounders.iter().enumerate() {
                 if c.len() != req.samples.len() {
-                    return Err(format!("confounder column {i} has {} entries, expected {}", c.len(), req.samples.len()));
+                    return Err(format!(
+                        "confounder column {i} has {} entries, expected {}",
+                        c.len(),
+                        req.samples.len()
+                    ));
                 }
             }
-            io::Meta { samples: req.samples.clone(), groups: req.groups.clone(), confounders: req.confounders.clone() }
+            io::Meta {
+                samples: req.samples.clone(),
+                groups: req.groups.clone(),
+                confounders: req.confounders.clone(),
+            }
         }
     };
     let mut an = analyse(&source, &meta, &req.params, req.null_cache.as_deref())?;
@@ -331,7 +422,15 @@ fn cmd_json(default_threads: usize) -> Result<(), String> {
             r.introns.clear();
         }
     }
-    let resp = Response { group_names: an.group_names, n_samples: an.n_samples, n_clusters: an.n_clusters, confounder_columns: an.confounder_names, summary, timing_ms: an.timing, clusters: an.results };
+    let resp = Response {
+        group_names: an.group_names,
+        n_samples: an.n_samples,
+        n_clusters: an.n_clusters,
+        confounder_columns: an.confounder_names,
+        summary,
+        timing_ms: an.timing,
+        clusters: an.results,
+    };
     let out = std::io::stdout();
     let mut lock = out.lock();
     serde_json::to_writer(&mut lock, &resp).map_err(|e| e.to_string())?;
@@ -339,14 +438,32 @@ fn cmd_json(default_threads: usize) -> Result<(), String> {
     Ok(())
 }
 
-fn cmd_simulate(prefix: &str, n: usize, m: usize, seed: u64, frac: f64, depth: f64, store: bool) -> Result<(), String> {
-    let sim = simulate(&SimParams { n_samples: n, n_clusters: m, seed, frac_differential: frac, mean_depth: depth, ..Default::default() });
+fn cmd_simulate(
+    prefix: &str,
+    n: usize,
+    m: usize,
+    seed: u64,
+    frac: f64,
+    depth: f64,
+    store: bool,
+) -> Result<(), String> {
+    let sim = simulate(&SimParams {
+        n_samples: n,
+        n_clusters: m,
+        seed,
+        frac_differential: frac,
+        mean_depth: depth,
+        ..Default::default()
+    });
     let counts = PathBuf::from(format!("{prefix}_perind_numers.counts.gz"));
     io::write_counts(&counts, &sim.samples, &sim.clusters).map_err(|e| e.to_string())?;
     let groups = format!("{prefix}_groups.txt");
     let mut g = String::new();
     for (s, gr) in sim.samples.iter().zip(&sim.group) {
-        g.push_str(&format!("{s}\t{}\n", if *gr == 0 { "control" } else { "case" }));
+        g.push_str(&format!(
+            "{s}\t{}\n",
+            if *gr == 0 { "control" } else { "case" }
+        ));
     }
     std::fs::write(&groups, g).map_err(|e| e.to_string())?;
     let truth = format!("{prefix}_truth.txt");
@@ -357,7 +474,8 @@ fn cmd_simulate(prefix: &str, n: usize, m: usize, seed: u64, frac: f64, depth: f
     std::fs::write(&truth, t).map_err(|e| e.to_string())?;
     if store {
         let path = PathBuf::from(format!("{prefix}.lcs"));
-        leafcutter_rs::store::write_store(&sim.samples, &sim.clusters, &path).map_err(|e| e.to_string())?;
+        leafcutter_rs::store::write_store(&sim.samples, &sim.clusters, &path)
+            .map_err(|e| e.to_string())?;
         eprintln!("Wrote {}", path.display());
     }
     eprintln!("Wrote {} , {groups} and {truth}", counts.display());
@@ -372,17 +490,42 @@ fn main() {
             let r = cmd_json(threads);
             if let Err(e) = &r {
                 // machine-readable error on stdout for the calling process
-                println!("{}", serde_json::to_string(&ErrorResponse { error: e.clone() }).unwrap());
+                println!(
+                    "{}",
+                    serde_json::to_string(&ErrorResponse { error: e.clone() }).unwrap()
+                );
             }
             r
         }
         Cmd::BuildStore { counts_file, store } => {
             let t = Instant::now();
-            io::read_counts(&counts_file).and_then(|table| build_store(&table, &store)).map(|_| {
-                eprintln!("Wrote {} in {:.1}s", store.display(), t.elapsed().as_secs_f64());
-            })
+            io::read_counts(&counts_file)
+                .and_then(|table| build_store(&table, &store))
+                .map(|_| {
+                    eprintln!(
+                        "Wrote {} in {:.1}s",
+                        store.display(),
+                        t.elapsed().as_secs_f64()
+                    );
+                })
         }
-        Cmd::Simulate { output_prefix, samples, clusters, seed, frac_differential, mean_depth, store } => cmd_simulate(&output_prefix, samples, clusters, seed, frac_differential, mean_depth, store),
+        Cmd::Simulate {
+            output_prefix,
+            samples,
+            clusters,
+            seed,
+            frac_differential,
+            mean_depth,
+            store,
+        } => cmd_simulate(
+            &output_prefix,
+            samples,
+            clusters,
+            seed,
+            frac_differential,
+            mean_depth,
+            store,
+        ),
     };
     if let Err(e) = res {
         eprintln!("Error: {e}");

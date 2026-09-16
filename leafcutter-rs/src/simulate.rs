@@ -132,7 +132,15 @@ pub struct SimParams {
 
 impl Default for SimParams {
     fn default() -> Self {
-        SimParams { n_samples: 100, n_clusters: 1000, seed: 1, frac_differential: 0.1, mean_depth: 40.0, dropout: 0.05, max_introns: 6 }
+        SimParams {
+            n_samples: 100,
+            n_clusters: 1000,
+            seed: 1,
+            frac_differential: 0.1,
+            mean_depth: 40.0,
+            dropout: 0.05,
+            max_introns: 6,
+        }
     }
 }
 
@@ -170,7 +178,14 @@ pub fn simulate(params: &SimParams) -> SimData {
         let chrom = format!("chr{}", 1 + c % 22);
         let start = pos;
         let introns: Vec<String> = (0..k)
-            .map(|j| format!("{chrom}:{}:{}:clu_{}_NA", start + 100 * j as u64, start + 5000 + 300 * j as u64, c + 1))
+            .map(|j| {
+                format!(
+                    "{chrom}:{}:{}:clu_{}_NA",
+                    start + 100 * j as u64,
+                    start + 5000 + 300 * j as u64,
+                    c + 1
+                )
+            })
             .collect();
         pos += 20_000;
         let mut counts = vec![0u32; n * k];
@@ -186,8 +201,18 @@ pub fn simulate(params: &SimParams) -> SimData {
             let y = rng.multinomial(total, &probs);
             counts[i * k..(i + 1) * k].copy_from_slice(&y);
         }
-        clusters.push(Cluster { name: format!("{chrom}:clu_{}_NA", c + 1), introns, n, counts });
+        clusters.push(Cluster {
+            name: format!("{chrom}:clu_{}_NA", c + 1),
+            introns,
+            n,
+            counts,
+        });
         differential.push(diff);
     }
-    SimData { samples, group, clusters, differential }
+    SimData {
+        samples,
+        group,
+        clusters,
+        differential,
+    }
 }

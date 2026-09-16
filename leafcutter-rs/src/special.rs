@@ -26,7 +26,11 @@ pub fn digamma(mut x: f64) -> f64 {
                 * (1.0 / 120.0
                     - inv2
                         * (1.0 / 252.0
-                            - inv2 * (1.0 / 240.0 - inv2 * (1.0 / 132.0 - inv2 * (691.0 / 32760.0 - inv2 / 12.0))))));
+                            - inv2
+                                * (1.0 / 240.0
+                                    - inv2
+                                        * (1.0 / 132.0
+                                            - inv2 * (691.0 / 32760.0 - inv2 / 12.0))))));
     acc + x.ln() - 0.5 * inv - series
 }
 
@@ -123,7 +127,11 @@ mod tests {
         for &x in &[0.05f64, 0.3, 1.0, 3.7, 25.0, 400.0] {
             let h = 1e-4 * x;
             let fd = (lgamma(x + h) - lgamma(x - h)) / (2.0 * h);
-            assert!((fd - digamma(x)).abs() < 1e-6 * (1.0 + digamma(x).abs()), "x={x} fd={fd} psi={}", digamma(x));
+            assert!(
+                (fd - digamma(x)).abs() < 1e-6 * (1.0 + digamma(x).abs()),
+                "x={x} fd={fd} psi={}",
+                digamma(x)
+            );
         }
     }
 
@@ -139,7 +147,10 @@ mod tests {
         ];
         for (x, df, expect) in cases {
             let got = chisq_sf(x, df);
-            assert!(((got - expect) / expect).abs() < 1e-9, "x={x} df={df} got={got} expect={expect}");
+            assert!(
+                ((got - expect) / expect).abs() < 1e-9,
+                "x={x} df={df} got={got} expect={expect}"
+            );
         }
         assert_eq!(chisq_sf(-1.0, 3.0), 1.0);
         assert_eq!(chisq_sf(0.0, 3.0), 1.0);

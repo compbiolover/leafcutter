@@ -1,7 +1,10 @@
 #!/usr/bin/env python3
 """Compare `leafcutter_ds run --json` output with `reference_ds.py` output."""
 import json
+import signal
 import sys
+
+signal.signal(signal.SIGPIPE, signal.SIG_DFL)
 
 import numpy as np
 

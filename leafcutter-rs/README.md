@@ -26,16 +26,23 @@ Exactly the statistical procedure of the R package (`leafcutter/R/differential_s
 
 Stan's `simplex × scale` encoding of the coefficient rows is replaced by free sum-to-zero rows
 and log-concentrations; the objective and the test are invariant to that reparameterisation.
-Two things go beyond the R code, both optional:
+Three things differ from the R code by default, each switchable:
 
-* `--full-extra-starts N` (default 1): the posterior can have several modes that differ in
-  the concentrations, and a single L-BFGS run (R's behaviour, `N = 0`) lands in whichever mode
-  its trajectory finds. Extra starting points for the full model keep the best mode.
-* the null fit of a cluster does not depend on the group labels, so it can be cached per
-  cohort (`--null-cache`, or `null_cache` in a JSON request) and reused across requests that
-  regroup the same samples.
+* **Stopping rules.** `rstan::optimizing`'s default L-BFGS tolerances stop noticeably early in
+  the flat concentration directions of this model (fits typically end ~1e-2 below the optimum
+  in log posterior, sometimes more). The default here is tighter (relative gradient 1e4·ε,
+  relative objective 1e2·ε, history 10) and lands within ~1e-5 of the optimum at about twice
+  the optimisation cost.
+* **Extra start for the full model** (`--full-extra-starts`, default 1). The posterior can
+  have several modes that differ in the concentrations; a single warm-started L-BFGS run (R's
+  behaviour) lands in whichever mode its trajectory finds. The extra start (method-of-moments
+  coefficients, fresh concentrations) keeps the best mode.
+* **Null-fit cache.** The null fit of a cluster does not depend on the group labels, so it can
+  be cached per cohort (`--null-cache`, or `null_cache` in a JSON request) and reused across
+  requests that regroup the same samples.
 
-The `robust` outlier model is not ported.
+`--like-r` (Stan's stopping rules, no extra start) reproduces the R procedure exactly, ~3–4×
+faster than the default. The `robust` outlier model is not ported.
 
 ## Performance design
 
@@ -50,19 +57,28 @@ The `robust` outlier model is not ported.
   requested samples (rows are sample-major inside a cluster block, `u16` or `u32` per cluster).
 * **rayon** over clusters; `-p` / `"threads"` selects the thread count.
 
-Measured on 2 000 simulated clusters (4 cores of a small VM, including I/O):
+Measured on 2 000 simulated clusters (`leafcutter_ds simulate`, 2–6 introns per cluster,
+mean depth 40) on a 4-core VM, fitting time only:
 
-| samples | 1 thread | 4 threads | per cluster per core |
-|--------:|---------:|----------:|---------------------:|
-|     100 |   1.3 s  |   0.34 s  |  0.65 ms             |
-|     400 |   1.6 s  |   0.44 s  |  0.8 ms              |
-|   1 000 |   1.9 s  |   0.50 s  |  0.9 ms              |
-|  10 000 |   6.1 s  |   1.6 s   |  3.0 ms              |
+| samples | default, 1 thread | default, 4 threads | per cluster per core | `--like-r`, 1 thread | `--like-r`, 4 threads |
+|--------:|------------------:|-------------------:|---------------------:|---------------------:|----------------------:|
+|     100 |            3.1 s  |             0.87 s |               1.5 ms |               0.83 s |                0.23 s |
+|     400 |            3.6 s  |             0.95 s |               1.8 ms |               0.75 s |                0.22 s |
+|   1 000 |            4.2 s  |             1.2 s  |               2.1 ms |               0.70 s |                0.21 s |
+|  10 000 |            4.7 s  |             1.3 s  |               2.4 ms |               1.5 s  |                0.39 s |
 
-(`--full-extra-starts 0`; the default extra start roughly doubles the fitting time.) Scaled to
-30 000 clusters on 8 threads this is about 3 s at N = 100 and 12 s at N = 10 000 before the
-extra start, well inside the 60 s budget. Peak RSS stays in the tens of MB because only one
-cluster per thread is live.
+Scaled to 30 000 clusters on 8 threads: about 6 s at N = 100 and 9 s at N = 10 000 with the
+defaults, 1.6 s and 3 s with `--like-r`. The cost per cluster is almost flat in N because of the
+collapse; at N = 10 000 about 0.3 ms of the 1.5 ms per cluster is gathering, filtering and
+histogramming, the rest is L-BFGS. A request for a 100-sample subset of a 10 000-sample store
+costs the same as a 100-sample dataset.
+
+Memory: only one cluster per thread is live. Reading a `.counts.gz` file keeps the whole
+table in memory (`u32`, ~4 bytes × introns × samples: 650 MB peak RSS for 7 900 introns ×
+10 000 samples), so for large cohorts build the store once and run on it; the store is
+memory-mapped and its file-backed pages are reclaimable (peak anonymous memory stays in the
+tens of MB; the process RSS reported by the kernel includes whatever part of the mapped file
+was touched).
 
 ## Building
 
@@ -88,7 +104,8 @@ leafcutter_ds simulate -n 1000 -m 20000 -o sim --store
 ```
 
 Filter options mirror the R function defaults (`-s 10 -i 5 -g 4 -c 20`); note that the R
-*script* uses `-s Inf -g 3`.
+*script* uses `-s Inf -g 3`. Optimiser options: `--full-extra-starts`, `--tol-rel-grad`,
+`--tol-rel-obj`, `--history`, `--max-iter`, `--like-r`.
 
 ## Child-process JSON protocol (Node)
 
@@ -104,7 +121,7 @@ stdout (errors are written as `{"error": "..."}` with a non-zero exit code):
   "threads": 8,
   "params": { "max_cluster_size": 10, "min_samples_per_intron": 5,
               "min_samples_per_group": 4, "min_coverage": 20,
-              "fit": { "full_extra_starts": 1 } },        // all optional
+              "fit": { "full_extra_starts": 1, "max_iter": 2000 } },   // all optional
   "null_cache": "/data/cohort_null.json", // optional
   "only_success": true, "omit_introns": false
 }
@@ -137,12 +154,21 @@ sample subset and labels, and reuse `null_cache` for requests that regroup the s
 
 R/rstan is not needed for the tests, but `scripts/reference_ds.py` is an independent
 implementation in numpy/autograd/scipy that uses *Stan's own parameterisation*, the R
-package's smart initialisation and refit rule, and a different optimiser. On simulated data
-(`leafcutter_ds simulate`) the two agree on every skip reason and on the significant set at
-p < 0.05, 0.001 and 1e-6; the log likelihood ratios agree to ~1e-3 except for clusters where
-the two optimisers settle in different posterior modes (see `--full-extra-starts`). Run
+package's smart initialisation and refit rule, and a different optimiser (scipy L-BFGS-B with
+very tight tolerances). On simulated data (300 clusters at N = 100, 150 clusters at N = 400):
+
+* every skip reason agrees, and the significant sets at p < 0.05, 0.001 and 1e-6 are identical;
+* with the default settings the median |Δ log LR| is 1e-4 (N = 100) and 3e-4 (N = 400), and the
+  Rust fit reaches a higher posterior than the reference in most clusters (243/300 and
+  120/150). The remaining disagreements are clusters where the two optimisers settle in
+  different posterior modes: a few very significant clusters whose log LR differs by tens (p
+  of 1e-77 vs 1e-58) and a few non-significant ones (e.g. p 0.42 vs 0.14);
+* with `--like-r` the median |Δ log LR| is 2e-3 (N = 100) and 2e-2 (N = 400), and the reference
+  is usually slightly higher: that is the early stopping of Stan's default tolerances, which
+  R inherits.
 
 ```
+leafcutter_ds simulate -n 100 -m 2000 -o sim
 leafcutter_ds run sim_perind_numers.counts.gz sim_groups.txt -o rust --json
 python3 scripts/reference_ds.py sim_perind_numers.counts.gz sim_groups.txt --out ref.json --max-clusters 300
 python3 scripts/compare_reference.py rust_results.json ref.json
@@ -167,5 +193,6 @@ src/nullcache.rs per-cohort cache of null fits
 src/simulate.rs  synthetic data
 src/bin/leafcutter_ds.rs   CLI + JSON protocol
 examples/debug_cluster.rs  trace the fits of one cluster
+examples/profile_setup.rs  per-phase timing of one cluster
 scripts/reference_ds.py    independent Python reference, compare_reference.py
 ```

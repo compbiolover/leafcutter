@@ -16,6 +16,52 @@
 use crate::design::ClusterData;
 use crate::special::{digamma, lgamma};
 
+/// Walks `lgamma(a + v)` and `digamma(a + v)` over increasing integer shifts `v`, using the
+/// recurrences `lgamma(x + 1) = lgamma(x) + ln x` and `digamma(x + 1) = digamma(x) + 1/x`
+/// for small gaps (a log and a division per step instead of two special-function calls) and
+/// direct evaluation for large jumps. Histograms are stored sorted, so most steps are small.
+struct ShiftWalker {
+    a: f64,
+    v: u32,
+    lg: f64,
+    dg: f64,
+}
+
+impl ShiftWalker {
+    const MAX_STEP: u32 = 24;
+
+    #[inline]
+    fn new(a: f64) -> Self {
+        ShiftWalker {
+            a,
+            v: 0,
+            lg: lgamma(a),
+            dg: digamma(a),
+        }
+    }
+
+    /// `(lgamma(a + v), digamma(a + v))` for `v >= self.v`.
+    #[inline]
+    fn at(&mut self, v: u32) -> (f64, f64) {
+        debug_assert!(v >= self.v);
+        let gap = v - self.v;
+        if gap > Self::MAX_STEP {
+            let x = self.a + v as f64;
+            self.lg = lgamma(x);
+            self.dg = digamma(x);
+        } else {
+            let mut x = self.a + self.v as f64;
+            for _ in 0..gap {
+                self.lg += x.ln();
+                self.dg += 1.0 / x;
+                x += 1.0;
+            }
+        }
+        self.v = v;
+        (self.lg, self.dg)
+    }
+}
+
 /// The model for one cluster.
 pub struct DmModel<'a> {
     pub data: &'a ClusterData,
@@ -25,7 +71,11 @@ pub struct DmModel<'a> {
 
 impl<'a> DmModel<'a> {
     pub fn new(data: &'a ClusterData, conc_shape: f64, conc_rate: f64) -> Self {
-        DmModel { data, conc_shape, conc_rate }
+        DmModel {
+            data,
+            conc_shape,
+            conc_rate,
+        }
     }
 
     #[inline]
@@ -87,17 +137,18 @@ impl<'a> DmModel<'a> {
                 a[j] = conc[j] * s[j];
                 big_a += a[j];
             }
-            if !(big_a > 0.0) || !big_a.is_finite() {
+            if big_a <= 0.0 || !big_a.is_finite() {
                 return f64::NEG_INFINITY;
             }
 
             // total terms: n_pos * lgamma(A) - Σ M lgamma(A + V)
             ll += cell.n_pos * lgamma(big_a);
             let mut g_a = cell.n_pos * digamma(big_a);
+            let mut walker = ShiftWalker::new(big_a);
             for &(v, m) in &cell.total_hist {
-                let av = big_a + v as f64;
-                ll -= m * lgamma(av);
-                g_a -= m * digamma(av);
+                let (lg, dg) = walker.at(v);
+                ll -= m * lg;
+                g_a -= m * dg;
             }
 
             // per-intron terms: Σ m (lgamma(a_k + v) - lgamma(a_k))
@@ -109,12 +160,12 @@ impl<'a> DmModel<'a> {
                     if aj <= 0.0 {
                         return f64::NEG_INFINITY;
                     }
-                    let lga = lgamma(aj);
-                    let dga = digamma(aj);
+                    let mut walker = ShiftWalker::new(aj);
+                    let (lga, dga) = (walker.lg, walker.dg);
                     for &(v, m) in h {
-                        let av = aj + v as f64;
-                        ll += m * (lgamma(av) - lga);
-                        gj += m * (digamma(av) - dga);
+                        let (lg, dg) = walker.at(v);
+                        ll += m * (lg - lga);
+                        gj += m * (dg - dga);
                     }
                 }
                 big_g[j] = gj;
@@ -145,7 +196,12 @@ impl<'a> DmModel<'a> {
 
     /// Dense reference implementation (one term per sample) used in tests.
     #[cfg(test)]
-    pub fn log_posterior_dense(&self, theta: &[f64], counts: &[u32], design: &crate::design::Design) -> f64 {
+    pub fn log_posterior_dense(
+        &self,
+        theta: &[f64],
+        counts: &[u32],
+        design: &crate::design::Design,
+    ) -> f64 {
         let k = self.data.k;
         let p = self.data.p;
         let (beta, log_conc) = theta.split_at(p * k);
@@ -154,7 +210,9 @@ impl<'a> DmModel<'a> {
         for n in 0..design.n {
             let x = design.row(n);
             let y = &counts[n * k..(n + 1) * k];
-            let eta: Vec<f64> = (0..k).map(|j| (0..p).map(|q| beta[q * k + j] * x[q]).sum()).collect();
+            let eta: Vec<f64> = (0..k)
+                .map(|j| (0..p).map(|q| beta[q * k + j] * x[q]).sum())
+                .collect();
             let m = eta.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
             let ex: Vec<f64> = eta.iter().map(|e| (e - m).exp()).collect();
             let z: f64 = ex.iter().sum();
@@ -206,7 +264,9 @@ mod tests {
         let (counts, n, k, d) = toy();
         let cd = ClusterData::build(&counts, n, k, &d);
         let model = DmModel::new(&cd, 1.0001, 1e-4);
-        let theta: Vec<f64> = vec![0.3, -0.1, -0.2, 0.5, -0.5, 0.0, 0.1, 0.2, -0.3, 2.0, 1.5, 2.5];
+        let theta: Vec<f64> = vec![
+            0.3, -0.1, -0.2, 0.5, -0.5, 0.0, 0.1, 0.2, -0.3, 2.0, 1.5, 2.5,
+        ];
         let mut g = vec![0.0; theta.len()];
         let ll = model.log_posterior(&theta, &mut g);
         let ll_dense = model.log_posterior_dense(&theta, &counts, &d);
@@ -218,7 +278,9 @@ mod tests {
         let (counts, n, k, d) = toy();
         let cd = ClusterData::build(&counts, n, k, &d);
         let model = DmModel::new(&cd, 1.0001, 1e-4);
-        let theta: Vec<f64> = vec![0.3, -0.1, -0.2, 0.5, -0.5, 0.0, 0.1, 0.2, -0.3, 2.0, 1.5, 2.5];
+        let theta: Vec<f64> = vec![
+            0.3, -0.1, -0.2, 0.5, -0.5, 0.0, 0.1, 0.2, -0.3, 2.0, 1.5, 2.5,
+        ];
         let mut g = vec![0.0; theta.len()];
         let _ = model.log_posterior(&theta, &mut g);
         let mut scratch = vec![0.0; theta.len()];
@@ -228,8 +290,14 @@ mod tests {
             tp[i] += h;
             let mut tm = theta.clone();
             tm[i] -= h;
-            let fd = (model.log_posterior(&tp, &mut scratch) - model.log_posterior(&tm, &mut scratch)) / (2.0 * h);
-            assert!((fd - g[i]).abs() < 1e-6 * (1.0 + fd.abs()), "param {i}: fd={fd} analytic={}", g[i]);
+            let fd = (model.log_posterior(&tp, &mut scratch)
+                - model.log_posterior(&tm, &mut scratch))
+                / (2.0 * h);
+            assert!(
+                (fd - g[i]).abs() < 1e-6 * (1.0 + fd.abs()),
+                "param {i}: fd={fd} analytic={}",
+                g[i]
+            );
         }
         // beta rows' gradients are sum-to-zero
         for q in 0..cd.p {
