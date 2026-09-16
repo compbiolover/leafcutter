@@ -148,9 +148,20 @@ impl Store {
                 ),
             }
         }
+        let annotations: Vec<String> = {
+            let mut a: Vec<String> = m
+                .introns
+                .iter()
+                .filter_map(|s| s.split(':').nth(4).map(String::from))
+                .collect();
+            a.sort();
+            a.dedup();
+            a
+        };
         Cluster {
             name: m.name.clone(),
             introns: m.introns.clone(),
+            annotations,
             n: sample_idx.len(),
             counts,
         }
@@ -166,12 +177,14 @@ mod tests {
         let samples: Vec<String> = (0..5).map(|i| format!("s{i}")).collect();
         let clusters = vec![
             Cluster {
+                annotations: vec![],
                 name: "c1".into(),
                 introns: vec!["a".into(), "b".into()],
                 n: 5,
                 counts: (0..10).collect(),
             },
             Cluster {
+                annotations: vec![],
                 name: "c2".into(),
                 introns: vec!["c".into(), "d".into(), "e".into()],
                 n: 5,

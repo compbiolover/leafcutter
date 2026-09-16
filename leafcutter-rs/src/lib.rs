@@ -22,6 +22,7 @@ pub mod design;
 pub mod dm;
 pub mod ds;
 pub mod fit;
+pub mod genes;
 pub mod io;
 pub mod lbfgs;
 pub mod nullcache;

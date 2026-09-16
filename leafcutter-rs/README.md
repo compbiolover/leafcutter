@@ -1,48 +1,56 @@
-# leafcutter-rs — LeafCutter differential splicing in Rust
+# leafcutter-rs — leafcutter-ds in Rust
 
-A port of LeafCutter's differential splicing test (`leafcutter_ds.R`) to Rust, built for
-interactive use: genome-wide cluster p-values, q-values and per-intron ΔPSI for a cohort
-of hundreds to tens of thousands of samples in seconds, with a small memory footprint, so it
-can be called from a Node server (e.g. a ProteinPaint portal) as a child process.
+A Rust port of [leafcutter-ds](https://github.com/leafcutter2/leafcutter-ds), the Python/Pyro
+re-implementation of LeafCutter's differential splicing test that is compatible with
+[leafcutter2](https://github.com/leafcutter2/leafcutter2) annotated clusters. It is built for
+interactive use: genome-wide cluster p-values, q-values and per-intron ΔPSI for cohorts of
+hundreds to tens of thousands of samples in seconds, with a small memory footprint, callable
+from a Node server (e.g. a ProteinPaint portal) as a child process.
+
+It also reproduces the original R package's procedure (`--like-r`), see below.
 
 ## What it computes
 
-Exactly the statistical procedure of the R package (`leafcutter/R/differential_splicing.R`,
-`dm_glm_multi_conc.R`, `inst/stan/dm_glm_multi_conc.stan`, non-robust model):
+The statistical procedure of `leafcutter/differential_splicing/{differential_splicing,dm_glm,optim}.py`:
 
-* per intron cluster, the same filters (`max_cluster_size`, `min_samples_per_intron`,
-  `min_samples_per_group`, `min_coverage`) with the same skip reasons;
-* a Dirichlet-multinomial GLM fitted by maximum a posteriori estimation (L-BFGS, analytic
-  gradient) under the null design (intercept + confounders) and the full design (+ group),
-  with the Gamma(1.0001, 1e-4) prior on the per-intron concentrations;
-* the likelihood ratio statistic `2 (ℓ_full − ℓ_null)` against χ² with `(K−1)(P_full − P_null)`
-  degrees of freedom, the R package's "smart" method-of-moments initialisation, warm start of
-  the full fit from the null fit, and the "refit the null from the full solution if p < 0.001"
-  rule;
-* Benjamini–Hochberg adjusted p-values (`p.adjust(method = "fdr")`) and, in JSON output,
-  Storey q-values (λ = 0.5);
-* per-intron effect sizes as `leaf_cutter_effect_sizes`: log effect size, baseline PSI,
-  perturbed PSI and ΔPSI.
+* the same per-cluster filters and skip reasons (`max_cluster_size`, `min_samples_per_intron`,
+  `min_samples_per_group`, `min_coverage`, `min_unique_vals`);
+* a categorical phenotype with any number of groups (`--baseline_group`, one design column
+  per non-baseline group, empty groups dropped per cluster) or a continuous phenotype
+  (standardised, one column); numeric confounders standardised, categorical confounders
+  one-hot encoded with the first sorted level dropped, samples with missing confounders
+  removed;
+* a Dirichlet-multinomial GLM with one concentration per junction, `Gamma(1.0001, 1e-4)`
+  concentration prior, improper flat prior on the coefficients, `conc` bounded by 3000 through
+  a sigmoid and a `1e-8` pseudocount on the Dirichlet parameters, fitted by MAP with L-BFGS
+  (`max_iter = 500`, `history = 100`, `tolerance_grad = 1e-7`, `tolerance_change = 1e-9`,
+  strong-Wolfe line search: the settings leafcutter-ds passes to `torch.optim.LBFGS`);
+* the initialisation strategies `brr` (a port of scikit-learn's `BayesianRidge`, the
+  default), `rr`, `mult` and `0`;
+* the fitting procedure of `dirichlet_multinomial_anova`: null fit from the init; full fit
+  from the null solution and from a fresh init, keeping the better; every fit starts with
+  `conc = 10`; likelihood ratio statistic against χ² with `(K−1)(P_full − P_null)` degrees of
+  freedom; null refitted from the full solution when p < 0.001;
+* Benjamini–Hochberg adjusted p-values (`scipy.stats.false_discovery_control`), plus Storey
+  q-values in the JSON output;
+* per-intron effect sizes: `logef_<group>`, `psi_<baseline>`, `psi_<group>`, `deltapsi_<group>`;
+* gene labels from an exon table (`--exon_file`, same start/end matching rule as
+  `map_clusters_to_genes`) and, for leafcutter2 input with `chr:start:end:clu:annotation`
+  intron names, the `annotations` column.
 
-Stan's `simplex × scale` encoding of the coefficient rows is replaced by free sum-to-zero rows
-and log-concentrations; the objective and the test are invariant to that reparameterisation.
-Three things differ from the R code by default, each switchable:
+Not ported: `leafcutter-bayes` (the spike-and-slab per-junction model), the plotting scripts
+and the clustering step (use `leafcutter-cluster` / leafcutter2 for those).
 
-* **Stopping rules.** `rstan::optimizing`'s default L-BFGS tolerances stop noticeably early in
-  the flat concentration directions of this model (fits typically end ~1e-2 below the optimum
-  in log posterior, sometimes more). The default here is tighter (relative gradient 1e4·ε,
-  relative objective 1e2·ε, history 10) and lands within ~1e-5 of the optimum at about twice
-  the optimisation cost.
-* **Extra start for the full model** (`--full-extra-starts`, default 1). The posterior can
-  have several modes that differ in the concentrations; a single warm-started L-BFGS run (R's
-  behaviour) lands in whichever mode its trajectory finds. The extra start (method-of-moments
-  coefficients, fresh concentrations) keeps the best mode.
-* **Null-fit cache.** The null fit of a cluster does not depend on the group labels, so it can
-  be cached per cohort (`--null-cache`, or `null_cache` in a JSON request) and reused across
-  requests that regroup the same samples.
+### Differences from the Python implementation
 
-`--like-r` (Stan's stopping rules, no extra start) reproduces the R procedure exactly, ~3–4×
-faster than the default. The `robust` outlier model is not ported.
+* Arithmetic is `f64`; leafcutter-ds runs in `float32`, where torch's `tolerance_change = 1e-9`
+  cannot be resolved at the scale of the objective (~1e3–1e5), so its fits stop early. The
+  port converges further and reaches a higher posterior in most clusters (see Validation).
+* The log posterior omits the Gamma prior's normalising constant (`K (shape·ln rate − lgamma
+  shape)`), which Pyro includes; it cancels in the likelihood ratio.
+* The R package's procedure is available with `--like-r` (rstan's stopping rules, ridge
+  init, warm-started concentrations, single start) or `--r-procedure` (the same procedure
+  with tighter stopping rules and an extra start).
 
 ## Performance design
 
@@ -50,62 +58,65 @@ faster than the default. The `robust` outlier model is not ported.
   proportions, and the per-sample likelihood depends on the counts only through integers, so
   counts are histogrammed per (design cell, intron) and per (cell, row total). One objective
   evaluation costs `Σ_cells (K + distinct values)` `lgamma`/`digamma` pairs instead of `N × K`;
-  with categorical designs the cost stops growing with `N`. Continuous covariates simply make
-  every sample its own cell (the dense computation).
+  with categorical designs the cost stops growing with `N`. A continuous phenotype or
+  confounder makes every sample its own cell, which costs roughly 10× at N = 100 and grows
+  linearly with N (5.8 s vs 0.6 s for the 2 000-cluster benchmark below, 4 threads).
+* `lgamma`/`digamma` over consecutive integer shifts advance by a log and a division.
+* The Bayesian-ridge initialiser works from sufficient statistics collected in one pass, so
+  its 300-iteration loop costs `O(P²)` per junction regardless of `N`.
 * **No dense matrices.** Counts are kept per cluster as `u32`; a memory-mapped cluster-major
   store (`build-store`) lets a request stream one cluster per thread and gather only the
   requested samples (rows are sample-major inside a cluster block, `u16` or `u32` per cluster).
 * **rayon** over clusters; `-p` / `"threads"` selects the thread count.
+* The null fit does not depend on the phenotype, so it can be cached per cohort
+  (`--null-cache` / `null_cache`) and reused across requests that regroup the same samples.
 
 Measured on 2 000 simulated clusters (`leafcutter_ds simulate`, 2–6 introns per cluster,
-mean depth 40) on a 4-core VM, fitting time only:
+mean depth 40, two groups, no confounders) on a 4-core VM, fitting time only:
 
-| samples | default, 1 thread | default, 4 threads | per cluster per core | `--like-r`, 1 thread | `--like-r`, 4 threads |
-|--------:|------------------:|-------------------:|---------------------:|---------------------:|----------------------:|
-|     100 |            3.1 s  |             0.87 s |               1.5 ms |               0.83 s |                0.23 s |
-|     400 |            3.6 s  |             0.95 s |               1.8 ms |               0.75 s |                0.22 s |
-|   1 000 |            4.2 s  |             1.2 s  |               2.1 ms |               0.70 s |                0.21 s |
-|  10 000 |            4.7 s  |             1.3 s  |               2.4 ms |               1.5 s  |                0.39 s |
+| samples | 1 thread | 4 threads | per cluster per core | `--like-r`, 4 threads |
+|--------:|---------:|----------:|---------------------:|----------------------:|
+|     100 |   2.4 s  |   0.60 s  |   1.2 ms             |   0.23 s              |
+|     400 |   3.5 s  |   0.93 s  |   1.7 ms             |   0.22 s              |
+|   1 000 |   4.4 s  |   1.1 s   |   2.2 ms             |   0.21 s              |
+|  10 000 |   8.1 s  |   2.2 s   |   4.0 ms             |   0.39 s              |
 
-Scaled to 30 000 clusters on 8 threads: about 6 s at N = 100 and 9 s at N = 10 000 with the
-defaults, 1.6 s and 3 s with `--like-r`. The cost per cluster is almost flat in N because of the
-collapse; at N = 10 000 about 0.3 ms of the 1.5 ms per cluster is gathering, filtering and
-histogramming, the rest is L-BFGS. A request for a 100-sample subset of a 10 000-sample store
-costs the same as a 100-sample dataset.
+Scaled to 30 000 clusters on 8 threads: about 5 s at N = 100 and 15 s at N = 10 000. On the
+same machine and data, `leafcutter-ds -p 4` takes 99 s (N = 100) and 92 s (N = 400), and
+19 s for the 289-cluster Geuvadis example (0.35 s here). A request for a 100-sample subset of
+a 10 000-sample store costs the same as a 100-sample dataset.
 
-Memory: only one cluster per thread is live. Reading a `.counts.gz` file keeps the whole
-table in memory (`u32`, ~4 bytes × introns × samples: 650 MB peak RSS for 7 900 introns ×
-10 000 samples), so for large cohorts build the store once and run on it; the store is
-memory-mapped and its file-backed pages are reclaimable (peak anonymous memory stays in the
-tens of MB; the process RSS reported by the kernel includes whatever part of the mapped file
-was touched).
+Memory: only one cluster per thread is live. Reading a `.counts.gz` file keeps the whole table
+in memory (`u32`, ~4 bytes × introns × samples), so for large cohorts build the store once and
+run on it; the store is memory-mapped and its file-backed pages are reclaimable.
 
 ## Building
 
 ```
 cd leafcutter-rs
 cargo build --release          # binary: target/release/leafcutter_ds
-cargo test                     # unit + integration tests (simulated data)
+cargo test --release           # unit + integration tests (simulated data)
 ```
 
 ## Command line
 
 ```
-# same inputs as scripts/leafcutter_ds.R
-leafcutter_ds run counts_perind_numers.counts.gz groups.txt -o out -p 8 [--json]
+# same inputs and options as leafcutter-ds
+leafcutter_ds run counts_perind_numers.counts.gz groups.txt -0 Control -o out -p 8 \
+    [-e exons.txt.gz] [-s INF -i 5 -g 3 -c 20 -u 10] [--init brr] [--json]
 #   -> out_cluster_significance.txt, out_effect_sizes.txt [, out_results.json]
 
 # one-off conversion for large cohorts, then run on the store
 leafcutter_ds build-store counts_perind_numers.counts.gz cohort.lcs
-leafcutter_ds run cohort.lcs groups.txt -o out --null-cache cohort_null.json
+leafcutter_ds run cohort.lcs groups.txt -0 Control -o out --null-cache cohort_null.json
 
-# synthetic data for tests / benchmarks
+# synthetic data for tests / benchmarks (groups "control" / "case")
 leafcutter_ds simulate -n 1000 -m 20000 -o sim --store
 ```
 
-Filter options mirror the R function defaults (`-s 10 -i 5 -g 4 -c 20`); note that the R
-*script* uses `-s Inf -g 3`. Optimiser options: `--full-extra-starts`, `--tol-rel-grad`,
-`--tol-rel-obj`, `--history`, `--max-iter`, `--like-r`.
+Defaults match the `leafcutter-ds` command line (`-s inf -i 5 -g 3 -c 20 -u 10 --init brr`,
+baseline `Control`; a baseline that is not among the labels falls back to the first sorted
+label with a warning). `--like-r` / `--r-procedure` select the R package's procedure.
 
 ## Child-process JSON protocol (Node)
 
@@ -114,15 +125,18 @@ stdout (errors are written as `{"error": "..."}` with a non-zero exit code):
 
 ```jsonc
 {
-  "store": "/data/cohort.lcs",           // or "counts_file": "...counts.gz"
-  "samples": ["s1", "s2", "..."],        // any subset of the cohort, any order
-  "groups":  ["case", "ctrl", "..."],    // exactly two labels; first seen = 0 (numeric: sorted)
+  "store": "/data/cohort.lcs",              // or "counts_file": "...counts.gz"
+  "samples": ["s1", "s2", "..."],           // any subset of the cohort, any order
+  "groups":  ["ctrl", "caseA", "caseB"],    // labels (any number) or numbers (continuous)
+  "baseline_group": "ctrl",
   "confounders": [["b1","b2","..."], ["31","45","..."]],   // optional; numeric -> standardised, else one-hot
+  "exon_file": "/data/exons.txt.gz",        // optional, gene labels
   "threads": 8,
-  "params": { "max_cluster_size": 10, "min_samples_per_intron": 5,
-              "min_samples_per_group": 4, "min_coverage": 20,
-              "fit": { "full_extra_starts": 1, "max_iter": 2000 } },   // all optional
-  "null_cache": "/data/cohort_null.json", // optional
+  "params": { "max_cluster_size": 10, "min_samples_per_intron": 5, "min_samples_per_group": 3,
+              "min_coverage": 20, "min_unique_vals": 10,
+              "fit": { "init": "brr", "max_iter": 500 } },     // all optional
+  "like_r": false,
+  "null_cache": "/data/cohort_null.json",   // optional
   "only_success": true, "omit_introns": false
 }
 ```
@@ -131,100 +145,106 @@ Response:
 
 ```jsonc
 {
-  "group_names": ["ctrl", "case"], "n_samples": 512, "n_clusters": 31240,
-  "confounder_columns": ["V3b2", "V4"],
+  "baseline": "ctrl", "groups": ["caseA", "caseB"], "continuous": false,
+  "n_samples": 512, "n_clusters": 31240,
+  "confounder_columns": ["conf1=b2", "conf1=b3", "conf2"], "dropped_samples": [],
   "summary": { "Success": 28870, "Too many introns in cluster": 310, "...": 0 },
   "timing_ms": { "fit_ms": 4180, "total_ms": 4302 },
   "clusters": [
-    { "cluster": "chr1:clu_12_NA", "status": "Success", "loglr": 8.31, "df": 2,
+    { "cluster": "chr1:clu_12_NA", "status": "Success", "loglr": 8.31, "df": 4,
       "p": 2.5e-4, "p.adjust": 0.012, "q_storey": 0.009,
-      "introns": [ { "intron": "chr1:1000:2000:clu_12_NA", "logef": 0.8,
-                     "baseline": 0.31, "perturbed": 0.52, "deltapsi": 0.21 } ],
-      "n_samples": 498, "refit_null": false, "evaluations": 61,
+      "genes": "GENE1,GENE2", "annotations": ["PR", "UP"],
+      "introns": [ { "intron": "chr1:1000:2000:clu_12_NA:PR", "psi_baseline": 0.31,
+                     "effects": { "caseA": { "logef": 0.8, "psi": 0.52, "deltapsi": 0.21 },
+                                  "caseB": { "logef": 0.1, "psi": 0.33, "deltapsi": 0.02 } } } ],
+      "n_samples": 498, "refit_null": false, "smart_init_improved": true, "evaluations": 161,
       "value_null": -9123.4, "value_full": -9115.1, "converged": true }
   ]
 }
 ```
 
-Suggested deployment: build the store once per cohort (plus gene annotation from the
-clustering pipeline), keep the binary next to the Node server, spawn it per request with the
-sample subset and labels, and reuse `null_cache` for requests that regroup the same cohort.
+Suggested deployment: build the store once per cohort, keep the binary next to the Node
+server, spawn it per request with the sample subset and labels, and reuse `null_cache` for
+requests that regroup the same cohort.
 
 ## Validation
 
+### Against leafcutter-ds (Python)
+
+`scripts/compare_tables.py` compares the two output tables of two runs;
+`scripts/py_reference_fits.py` runs the Python model directly and dumps its per-cluster null
+and full log posteriors (which its CLI does not write). On the two examples shipped with
+leafcutter-ds and on simulated data, with identical options:
+
+| dataset | clusters | skip reasons | genes / annotations | significant at p < 1e-3 | p < 0.05 disagreements | BH < 0.05 disagreements | `leafcutter-ds -p 4` | `leafcutter_ds -p 4` |
+|--|--:|:-:|:-:|:-:|:-:|:-:|--:|--:|
+| Geuvadis sample (58 samples, sex, population confounder) | 289 | identical | identical | identical (1) | 4 of 254 | 0 | 19 s | 0.35 s |
+| leafcutter2 chr10 example (12 samples, annotated introns) | 951 | identical | identical | identical (125) | 1 of 419 | 0 | – | 0.13 s |
+| simulated, N = 100 | 2 000 | identical | identical | identical (167) | 9 of 1 998 | 2 | 99 s | 0.59 s |
+| simulated, N = 400 | 2 000 | identical | identical | 1 differs (192/193) | 40 of 2 000 | 2 | 92 s | 0.87 s |
+
+The disagreements are clusters where the Python fits stopped early: after removing Pyro's
+Gamma normalising constant, the Rust null and full log posteriors are higher than Python's
+in 212 and 203 of the 254 tested Geuvadis clusters (by more than 0.1 in 89 and 70) and lower
+by more than 1e-3 in only 11 and 20, never by more than 0.1. Effect sizes: PSI and ΔPSI agree
+to a median of ~1e-4 (max 4e-3 on the leafcutter2 example); `logef` differs by more than
+0.01 for introns whose usage is absent in one group, where the coefficient drifts towards
+−∞ and both implementations stop at an arbitrary point.
+
+```
+leafcutter-ds -0 male -e exons.txt.gz -o py counts.gz groups.txt -p 4
+leafcutter_ds run counts.gz groups.txt -0 male -e exons.txt.gz -o rs -p 4
+python3 scripts/compare_tables.py py rs
+```
+
 ### Against the R package
 
-`scripts/run_r_reference.R` runs the R package's own test (it sources `leafcutter/R` and
-compiles `inst/stan/dm_glm_multi_conc.stan` with rstan; only rstan, foreach, doMC, dplyr and
-R.utils are needed) and `scripts/r_to_reference_json.py` converts its output for
-`compare_reference.py`. On the simulated datasets, all 2 000 clusters:
-
-| samples | skip reasons | significant set p < 1e-6 / 1e-3 | p < 0.05 disagreements | median Δ log LR (default / `--like-r`) | R time (4 thr.) | Rust time (4 thr., default / `--like-r`) |
-|--------:|:------------:|:-------------------------------:|:----------------------:|:--------------------------------------:|----------------:|-----------------------------------------:|
-|     100 | identical    | identical / identical           | 11 of 2 000            | 7e-3 / 3e-3                            |          23 s   | 0.87 s / 0.23 s                          |
-|     400 | identical    | identical / identical           | 14                     | 4e-2 / 4e-3                            |          45 s   | 0.95 s / 0.22 s                          |
-|   1 000 | identical    | identical / 2 differ            | 27                     | 9e-2 / 4e-3                            |          78 s   | 1.2 s / 0.21 s                           |
-
-The null fits agree with R to ~1e-5 in log posterior. Every disagreement is a cluster where
-the Rust full fit reached a *higher* posterior than rstan's (all 11 + 14 + 27, and with the
-defaults Rust's full fit is lower than R's by more than 1e-3 in only 7–10 clusters per
-dataset): `rstan::optimizing` stops early in the flat concentration directions, increasingly
-so with N (median full-fit deficit 7e-3 at N = 100, 9e-2 at N = 1 000). So the port
-reproduces R's procedure (`--like-r`: median Δ log LR 3e-3 to 4e-3) and, by default, the
-statistic R's procedure is trying to compute. Both R and the independent Python reference
-below were run on the same files; the Python reference also lands above R in every cluster
-where they differ by more than 0.1.
-
-To reproduce (a conda-forge environment avoids compiling rstan; two quirks: recent stanc no
-longer accepts the package's old array syntax, which the script rewrites on the fly, and
-oneTBB needs `-DTBB_INTERFACE_NEW` in `~/.R/Makevars` `CXX17FLAGS`):
+`scripts/run_r_reference.R` runs the R package's test (sources `leafcutter/R`, compiles the
+Stan model with rstan) and `scripts/r_to_reference_json.py` + `scripts/compare_reference.py`
+compare it with `leafcutter_ds run --json`. With `--r-procedure`, on 2 000 simulated clusters
+at N = 100 / 400 / 1 000: identical skip reasons and identical significant sets at p < 1e-6;
+11 / 14 / 27 disagreements at p < 0.05, every one a cluster where the Rust full fit reached a
+higher posterior than rstan's (`rstan::optimizing`'s default tolerances also stop early in
+the flat concentration directions). R takes 23 / 45 / 78 s on 4 threads for these, the port
+0.9 / 1.0 / 1.2 s. To reproduce with a conda-forge R (two quirks: recent stanc no longer
+accepts the package's old array syntax, which the script rewrites on the fly, and oneTBB
+needs `-DTBB_INTERFACE_NEW` in `~/.R/Makevars` `CXX17FLAGS`):
 
 ```
 micromamba create -n r -c conda-forge r-base r-rstan r-bh r-rcppeigen r-rcppparallel gxx_linux-64 make \
     r-foreach r-domc r-dplyr r-r.utils r-optparse r-magrittr
-leafcutter_ds simulate -n 100 -m 2000 -o sim
-leafcutter_ds run sim_perind_numers.counts.gz sim_groups.txt -o rust --json
 micromamba run -n r Rscript scripts/run_r_reference.R sim_perind_numers.counts.gz sim_groups.txt r_out 0 4
 python3 scripts/r_to_reference_json.py r_out r.json
+leafcutter_ds run sim_perind_numers.counts.gz sim_groups.txt -0 control -o rust --json --r-procedure
 python3 scripts/compare_reference.py rust_results.json r.json
 ```
 
-### Against an independent Python implementation
+`scripts/reference_ds.py` is a third, independent numpy/autograd/scipy implementation of the
+R/Stan model used during development.
 
-`scripts/reference_ds.py` is an independent implementation in numpy/autograd/scipy that uses
-*Stan's own parameterisation*, the R package's smart initialisation and refit rule, and a
-different optimiser (scipy L-BFGS-B with very tight tolerances). On 300 clusters at N = 100
-and 150 clusters at N = 400: every skip reason agrees, the significant sets at p < 0.05,
-0.001 and 1e-6 are identical, and with the default settings the median |Δ log LR| is 1e-4 to
-3e-4; the Rust fit reaches a higher posterior than the reference in most clusters (243/300
-and 120/150). The remaining disagreements are clusters where the two optimisers settle in
-different posterior modes.
-
-```
-python3 scripts/reference_ds.py sim_perind_numers.counts.gz sim_groups.txt --out ref.json --max-clusters 300
-python3 scripts/compare_reference.py rust_results.json ref.json
-```
-
-Unit tests check the analytic gradient against finite differences, the collapsed objective
-against the dense per-sample formula, `digamma` against the derivative of `lgamma`, the
-χ² survival function against scipy, BH against `p.adjust`, and every filter reason.
+Unit tests check the analytic gradient (both concentration parameterisations, the
+pseudocount and the multinomial model) against finite differences, the collapsed objective
+against the dense per-sample formula, `digamma` against the derivative of `lgamma`, the χ²
+survival function against scipy, BH against `p.adjust`, the Bayesian ridge against
+scikit-learn, the phenotype/confounder encoding, and every filter reason; integration tests
+cover power and calibration on simulated data, the store round trip and the null cache.
 
 ## Layout
 
 ```
 src/special.rs   lgamma / digamma / chi-square survival function
-src/lbfgs.rs     L-BFGS with strong-Wolfe line search (Stan's stopping rules)
+src/lbfgs.rs     L-BFGS with strong-Wolfe line search (torch and Stan stopping rules)
 src/design.rs    design matrices and the collapsed cluster representation
-src/dm.rs        Dirichlet-multinomial GLM objective + gradient
-src/fit.rs       smart init, null/full fits, LRT, refit rule, effect sizes
+src/dm.rs        Dirichlet-multinomial GLM objective + gradient, multinomial model
+src/fit.rs       initialisers (brr / rr / mult / 0), null/full fits, LRT, effect sizes
 src/ds.rs        filters, parallel driver, BH / Storey
-src/io.rs        counts / groups files, result tables
+src/io.rs        counts / groups files, phenotype encoding, result tables
+src/genes.rs     exon table and cluster-to-gene labelling
 src/store.rs     memory-mapped cluster-major count store
 src/nullcache.rs per-cohort cache of null fits
 src/simulate.rs  synthetic data
 src/bin/leafcutter_ds.rs   CLI + JSON protocol
-examples/debug_cluster.rs  trace the fits of one cluster
-examples/profile_setup.rs  per-phase timing of one cluster
-scripts/reference_ds.py    independent Python reference; compare_reference.py
-scripts/run_r_reference.R  run the R package's test; r_to_reference_json.py
+examples/                  debug_cluster (trace one cluster), profile_setup (per-phase timing)
+scripts/                   compare_tables.py, py_reference_fits.py, run_r_reference.R,
+                           r_to_reference_json.py, reference_ds.py, compare_reference.py
 ```

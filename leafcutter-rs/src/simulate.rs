@@ -203,6 +203,7 @@ pub fn simulate(params: &SimParams) -> SimData {
         }
         clusters.push(Cluster {
             name: format!("{chrom}:clu_{}_NA", c + 1),
+            annotations: Vec::new(),
             introns,
             n,
             counts,

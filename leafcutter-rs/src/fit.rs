@@ -4,10 +4,51 @@
 //! `leafcutter/R/differential_splicing.R`.
 
 use crate::design::{ClusterData, Design};
-use crate::dm::DmModel;
+use crate::dm::{ConcParam, DmModel, MultinomialModel};
 use crate::lbfgs::{self, LbfgsParams, Status};
 use crate::special::chisq_sf;
 use serde::{Deserialize, Serialize};
+
+/// How `beta` is initialised before the L-BFGS fit (leafcutter-ds `--init`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum InitStrategy {
+    /// Bayesian ridge regression per junction on `log((y+1)/rowsum(y+1))`
+    /// (scikit-learn's `BayesianRidge`, leafcutter-ds default).
+    Brr,
+    /// Ridge regression with a 0.001 penalty (the R package's "smart" init).
+    Rr,
+    /// Multinomial logistic regression fitted from zero.
+    Mult,
+    /// All zeros.
+    Zero,
+}
+
+impl std::str::FromStr for InitStrategy {
+    type Err = String;
+    fn from_str(s: &str) -> Result<Self, String> {
+        match s {
+            "brr" => Ok(InitStrategy::Brr),
+            "rr" => Ok(InitStrategy::Rr),
+            "mult" => Ok(InitStrategy::Mult),
+            "0" | "zero" => Ok(InitStrategy::Zero),
+            _ => Err(format!("unknown init strategy '{s}' (brr, rr, mult, 0)")),
+        }
+    }
+}
+
+/// Which package's fitting procedure to reproduce.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Procedure {
+    /// leafcutter-ds (Python/Pyro): null fit from the init; full fit from the null solution
+    /// and from a fresh init, keep the better; every fit starts with `conc = init_conc`;
+    /// refit the null from the full solution if p < 0.001.
+    Python,
+    /// The R/Stan package: full fit warm-started from the null (including the
+    /// concentrations); optional extra starts; refit rule as above.
+    R,
+}
 
 /// Model / optimiser settings.
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -17,7 +58,14 @@ pub struct FitParams {
     pub conc_shape: f64,
     /// Gamma rate of the prior on each concentration parameter.
     pub conc_rate: f64,
-    /// Ridge term protecting the method-of-moments initialiser against colinear covariates.
+    pub init: InitStrategy,
+    pub procedure: Procedure,
+    /// Upper bound of the concentrations (`conc = conc_max * sigmoid(u)`); `inf` selects the
+    /// unbounded log parameterisation of the R model.
+    pub conc_max: f64,
+    /// Pseudocount added to the Dirichlet parameters.
+    pub eps: f64,
+    /// Ridge term of the `rr` initialiser.
     pub smart_init_regularizer: f64,
     /// Initial concentration for every intron.
     pub init_conc: f64,
@@ -25,29 +73,69 @@ pub struct FitParams {
     pub refit_null_below_p: f64,
     #[serde(skip)]
     pub lbfgs: LbfgsParams,
-    /// Cap on L-BFGS iterations (overrides `lbfgs.max_iter`), mirrors R's per-cluster timeout.
+    /// Cap on L-BFGS iterations (overrides `lbfgs.max_iter`).
     pub max_iter: usize,
-    /// Extra starting points for the full model beyond the warm start from the null fit
-    /// (0 = exactly R's behaviour). The Dirichlet-multinomial posterior can have several
-    /// modes that differ in the concentrations; the best of all starts is kept.
+    /// R procedure only: extra starting points for the full model beyond the warm start.
     pub full_extra_starts: usize,
-    /// Only run the extra starts when a full-fit concentration moved by more than this factor
-    /// from the null fit (a sign of a mode switch). `1.0` disables the gate (always restart).
+    /// R procedure only: only run the extra starts when a concentration moved by more than
+    /// this factor between the null and full fits (`1.0` = always).
     pub restart_conc_ratio: f64,
 }
 
 impl Default for FitParams {
     fn default() -> Self {
+        FitParams::python()
+    }
+}
+
+impl FitParams {
+    /// leafcutter-ds defaults (`--init brr`, torch L-BFGS settings, `conc_max = 3000`,
+    /// `eps = 1e-8`).
+    pub fn python() -> Self {
         FitParams {
             conc_shape: 1.0001,
             conc_rate: 1e-4,
+            init: InitStrategy::Brr,
+            procedure: Procedure::Python,
+            conc_max: 3000.0,
+            eps: 1e-8,
             smart_init_regularizer: 0.001,
             init_conc: 10.0,
             refit_null_below_p: 0.001,
-            lbfgs: LbfgsParams::default(),
-            max_iter: 2000,
+            lbfgs: LbfgsParams::torch(),
+            max_iter: 500,
             full_extra_starts: 1,
             restart_conc_ratio: 1.0,
+        }
+    }
+
+    /// The R package's procedure with the tighter stopping rules of this crate.
+    pub fn r_like() -> Self {
+        FitParams {
+            init: InitStrategy::Rr,
+            procedure: Procedure::R,
+            conc_max: f64::INFINITY,
+            eps: 0.0,
+            lbfgs: LbfgsParams::default(),
+            max_iter: 2000,
+            ..FitParams::python()
+        }
+    }
+
+    /// Exactly `rstan::optimizing`'s stopping rules and a single start.
+    pub fn r_exact() -> Self {
+        FitParams {
+            lbfgs: LbfgsParams::stan(),
+            full_extra_starts: 0,
+            ..FitParams::r_like()
+        }
+    }
+
+    pub fn conc_param(&self) -> ConcParam {
+        if self.conc_max.is_finite() {
+            ConcParam::Sigmoid { max: self.conc_max }
+        } else {
+            ConcParam::Log
         }
     }
 }
@@ -226,10 +314,11 @@ pub fn fit_model(data: &ClusterData, beta0: &[f64], conc0: &[f64], params: &FitP
     let (p, k) = (data.p, data.k);
     assert_eq!(beta0.len(), p * k);
     assert_eq!(conc0.len(), k);
-    let model = DmModel::new(data, params.conc_shape, params.conc_rate);
+    let cp = params.conc_param();
+    let model = DmModel::with_options(data, params.conc_shape, params.conc_rate, params.eps, cp);
     let mut theta = Vec::with_capacity(model.n_params());
     theta.extend_from_slice(beta0);
-    theta.extend(conc0.iter().map(|c| c.max(1e-300).ln()));
+    theta.extend(conc0.iter().map(|&c| cp.unconstrained(c)));
     let mut lb = params.lbfgs.clone();
     lb.max_iter = params.max_iter;
     let mut grad_buf = vec![0.0; theta.len()];
@@ -244,18 +333,280 @@ pub fn fit_model(data: &ClusterData, beta0: &[f64], conc0: &[f64], params: &FitP
         &mut theta,
         &lb,
     );
-    let (beta, log_conc) = theta.split_at(p * k);
+    let (beta, conc_u) = theta.split_at(p * k);
     let mut beta = beta.to_vec();
     center_rows(&mut beta, p, k);
     Fit {
         p,
         k,
         beta,
-        conc: log_conc.iter().map(|v| v.exp()).collect(),
+        conc: conc_u.iter().map(|&u| cp.conc(u)).collect(),
         value: -res.f,
         iterations: res.iterations,
         evaluations: res.evaluations,
         converged: matches!(res.status, Status::Converged | Status::LineSearchFailed),
+    }
+}
+
+/// Fit the multinomial logistic regression (no concentrations) from `beta0`; used by the
+/// `mult` initialisation.
+pub fn fit_multinomial(data: &ClusterData, beta0: &[f64], params: &FitParams) -> Vec<f64> {
+    let model = MultinomialModel { data };
+    let mut theta = beta0.to_vec();
+    let mut lb = params.lbfgs.clone();
+    lb.max_iter = params.max_iter;
+    let mut grad_buf = vec![0.0; theta.len()];
+    let _ = lbfgs::minimize(
+        |x, g| {
+            let ll = model.log_likelihood(x, &mut grad_buf);
+            for (gi, gb) in g.iter_mut().zip(&grad_buf) {
+                *gi = -gb;
+            }
+            -ll
+        },
+        &mut theta,
+        &lb,
+    );
+    center_rows(&mut theta, data.p, data.k);
+    theta
+}
+
+/// Symmetric eigendecomposition by cyclic Jacobi rotations (for the tiny `P x P` systems of
+/// the initialisers). Returns `(eigenvalues, eigenvectors as columns, row-major p x p)`.
+fn jacobi_eigen(a_in: &[f64], p: usize) -> (Vec<f64>, Vec<f64>) {
+    let mut a = a_in.to_vec();
+    let mut v = vec![0.0; p * p];
+    for i in 0..p {
+        v[i * p + i] = 1.0;
+    }
+    for _sweep in 0..100 {
+        let mut off = 0.0;
+        for i in 0..p {
+            for j in 0..p {
+                if i != j {
+                    off += a[i * p + j] * a[i * p + j];
+                }
+            }
+        }
+        if off < 1e-30 {
+            break;
+        }
+        for pi in 0..p {
+            for qi in pi + 1..p {
+                let apq = a[pi * p + qi];
+                if apq.abs() < 1e-300 {
+                    continue;
+                }
+                let app = a[pi * p + pi];
+                let aqq = a[qi * p + qi];
+                let theta = (aqq - app) / (2.0 * apq);
+                let t = theta.signum() / (theta.abs() + (theta * theta + 1.0).sqrt());
+                let t = if theta == 0.0 { 1.0 } else { t };
+                let c = 1.0 / (t * t + 1.0).sqrt();
+                let s = t * c;
+                for kk in 0..p {
+                    let akp = a[kk * p + pi];
+                    let akq = a[kk * p + qi];
+                    a[kk * p + pi] = c * akp - s * akq;
+                    a[kk * p + qi] = s * akp + c * akq;
+                }
+                for kk in 0..p {
+                    let apk = a[pi * p + kk];
+                    let aqk = a[qi * p + kk];
+                    a[pi * p + kk] = c * apk - s * aqk;
+                    a[qi * p + kk] = s * apk + c * aqk;
+                }
+                for kk in 0..p {
+                    let vkp = v[kk * p + pi];
+                    let vkq = v[kk * p + qi];
+                    v[kk * p + pi] = c * vkp - s * vkq;
+                    v[kk * p + qi] = s * vkp + c * vkq;
+                }
+            }
+        }
+    }
+    ((0..p).map(|i| a[i * p + i]).collect(), v)
+}
+
+/// Sufficient statistics of one Bayesian ridge regression: `n`, column means of `X`, mean of
+/// `y`, and the raw (uncentred) `X'X`, `X'y`, `y'y`.
+struct RidgeStats {
+    n: f64,
+    xm: Vec<f64>,
+    ym: f64,
+    xtx: Vec<f64>,
+    xty: Vec<f64>,
+    yty: f64,
+}
+
+/// scikit-learn's `BayesianRidge` (defaults: `fit_intercept=True`, `max_iter=300`,
+/// `tol=1e-3`, `alpha_1 = alpha_2 = lambda_1 = lambda_2 = 1e-6`) solved from sufficient
+/// statistics, so the 300-iteration loop costs `O(P^2)` per iteration whatever `N` is.
+/// Returns the coefficients (the intercept is discarded, as leafcutter-ds discards
+/// `reg.intercept_`).
+fn bayesian_ridge_stats(st: &RidgeStats, p: usize) -> Vec<f64> {
+    let nf = st.n;
+    // centred moments: Xc'Xc = X'X - n x̄x̄', Xc'yc = X'y - n x̄ ȳ, yc'yc = y'y - n ȳ²
+    let mut xtx = vec![0.0; p * p];
+    let mut xty = vec![0.0; p];
+    for q in 0..p {
+        xty[q] = st.xty[q] - nf * st.xm[q] * st.ym;
+        for s in 0..p {
+            xtx[q * p + s] = st.xtx[q * p + s] - nf * st.xm[q] * st.xm[s];
+        }
+    }
+    let yty = (st.yty - nf * st.ym * st.ym).max(0.0);
+    let (eig, vecs) = jacobi_eigen(&xtx, p);
+    let eig: Vec<f64> = eig.iter().map(|e| e.max(0.0)).collect();
+    let proj: Vec<f64> = (0..p)
+        .map(|kk| (0..p).map(|q| vecs[q * p + kk] * xty[q]).sum())
+        .collect();
+    let coef_for = |alpha: f64, lambda: f64| -> Vec<f64> {
+        let mut c = vec![0.0; p];
+        for kk in 0..p {
+            let w = proj[kk] / (eig[kk] + lambda / alpha);
+            for q in 0..p {
+                c[q] += vecs[q * p + kk] * w;
+            }
+        }
+        c
+    };
+    let var_y = yty / nf;
+    let mut alpha = 1.0 / (var_y + f64::EPSILON);
+    let mut lambda = 1.0;
+    let (a1, a2, l1, l2) = (1e-6, 1e-6, 1e-6, 1e-6);
+    let mut coef_old: Vec<f64> = vec![0.0; p];
+    for it in 0..300 {
+        let coef = coef_for(alpha, lambda);
+        // ||yc - Xc coef||² = yc'yc - 2 coef'Xc'yc + coef'Xc'Xc coef
+        let mut quad = 0.0;
+        let mut lin = 0.0;
+        for q in 0..p {
+            lin += coef[q] * xty[q];
+            for s in 0..p {
+                quad += coef[q] * xtx[q * p + s] * coef[s];
+            }
+        }
+        let rmse = (yty - 2.0 * lin + quad).max(0.0);
+        let gamma: f64 = (0..p)
+            .map(|kk| alpha * eig[kk] / (lambda + alpha * eig[kk]))
+            .sum();
+        lambda = (gamma + 2.0 * l1) / (coef.iter().map(|c| c * c).sum::<f64>() + 2.0 * l2);
+        alpha = (nf - gamma + 2.0 * a1) / (rmse + 2.0 * a2);
+        if it != 0
+            && coef
+                .iter()
+                .zip(&coef_old)
+                .map(|(a, b)| (a - b).abs())
+                .sum::<f64>()
+                < 1e-3
+        {
+            break;
+        }
+        coef_old = coef;
+    }
+    coef_for(alpha, lambda)
+}
+
+/// scikit-learn's `BayesianRidge` on a dense design `x` (`n x p`, sample-major) and response
+/// `y`; see [`bayesian_ridge_stats`].
+pub fn bayesian_ridge(x: &[f64], n: usize, p: usize, y: &[f64]) -> Vec<f64> {
+    let mut st = RidgeStats {
+        n: n as f64,
+        xm: vec![0.0; p],
+        ym: 0.0,
+        xtx: vec![0.0; p * p],
+        xty: vec![0.0; p],
+        yty: 0.0,
+    };
+    for i in 0..n {
+        let r = &x[i * p..(i + 1) * p];
+        st.ym += y[i];
+        st.yty += y[i] * y[i];
+        for q in 0..p {
+            st.xm[q] += r[q];
+            st.xty[q] += r[q] * y[i];
+            for s in 0..p {
+                st.xtx[q * p + s] += r[q] * r[s];
+            }
+        }
+    }
+    st.ym /= n as f64;
+    for m in st.xm.iter_mut() {
+        *m /= n as f64;
+    }
+    bayesian_ridge_stats(&st, p)
+}
+
+/// leafcutter-ds's `brr` initialisation: Bayesian ridge regression of every junction's
+/// `log((y+1)/rowsum(y+1))` on the design, rows centred. One pass over the samples collects
+/// the sufficient statistics of all `K` regressions.
+pub fn brr_init(counts: &[u32], n: usize, k: usize, design: &Design) -> Vec<f64> {
+    let p = design.p;
+    let nf = n as f64;
+    let mut xm = vec![0.0; p];
+    let mut xtx = vec![0.0; p * p];
+    let mut ym = vec![0.0; k];
+    let mut yty = vec![0.0; k];
+    let mut xty = vec![0.0; p * k];
+    let mut ynorm = vec![0.0; k];
+    for i in 0..n {
+        let y = &counts[i * k..(i + 1) * k];
+        let tot: f64 = y.iter().map(|&v| v as f64 + 1.0).sum();
+        let ltot = tot.ln();
+        for j in 0..k {
+            ynorm[j] = (y[j] as f64 + 1.0).ln() - ltot;
+            ym[j] += ynorm[j];
+            yty[j] += ynorm[j] * ynorm[j];
+        }
+        let x = design.row(i);
+        for q in 0..p {
+            xm[q] += x[q];
+            for s in 0..p {
+                xtx[q * p + s] += x[q] * x[s];
+            }
+            for j in 0..k {
+                xty[q * k + j] += x[q] * ynorm[j];
+            }
+        }
+    }
+    for m in xm.iter_mut() {
+        *m /= nf;
+    }
+    let mut beta = vec![0.0; p * k];
+    for j in 0..k {
+        let st = RidgeStats {
+            n: nf,
+            xm: xm.clone(),
+            ym: ym[j] / nf,
+            xtx: xtx.clone(),
+            xty: (0..p).map(|q| xty[q * k + j]).collect(),
+            yty: yty[j],
+        };
+        let coef = bayesian_ridge_stats(&st, p);
+        for q in 0..p {
+            beta[q * k + j] = coef[q];
+        }
+    }
+    center_rows(&mut beta, p, k);
+    beta
+}
+
+/// Initial `beta` for a design according to the chosen strategy.
+pub fn init_beta(
+    strategy: InitStrategy,
+    counts: &[u32],
+    n: usize,
+    k: usize,
+    design: &Design,
+    data: &ClusterData,
+    params: &FitParams,
+) -> Vec<f64> {
+    match strategy {
+        InitStrategy::Brr => brr_init(counts, n, k, design),
+        InitStrategy::Rr => smart_init_collapsed(data, params.smart_init_regularizer),
+        InitStrategy::Zero => vec![0.0; design.p * k],
+        InitStrategy::Mult => fit_multinomial(data, &vec![0.0; design.p * k], params),
     }
 }
 
@@ -268,14 +619,16 @@ pub struct LrtResult {
     pub fit_null: Fit,
     pub fit_full: Fit,
     pub refit_null: bool,
+    /// Whether the full fit from the fresh initialisation beat the one from the null solution.
+    pub smart_init_improved: bool,
 }
 
 /// Fit the null and full models and compute the likelihood ratio test.
 ///
 /// * `counts` – sample-major `N x K` counts (already filtered).
 /// * `x_full` – full design, `N x P_full`.
-/// * `null_cols` – which columns of `x_full` make up the null design (e.g. everything but
-///   the group column).
+/// * `null_cols` – which columns of `x_full` make up the null design (leafcutter-ds and this
+///   crate put the intercept and confounders first, so this is `0..P_null`).
 /// * `cached_null` – an existing null fit for the same samples/design (e.g. from a cohort
 ///   cache); it must have been fitted on `x_full.select_columns(null_cols)`.
 pub fn lrt(
@@ -287,48 +640,67 @@ pub fn lrt(
     params: &FitParams,
     cached_null: Option<Fit>,
 ) -> LrtResult {
+    let x_null = x_full.select_columns(null_cols);
     let data_full = ClusterData::build(counts, n, k, x_full);
     let data_null = data_full.select_columns(null_cols);
     let p_null = null_cols.len();
+    let p_full = x_full.p;
+    let init_conc = vec![params.init_conc; k];
 
     let mut fit_null = match cached_null {
         Some(f) if f.p == p_null && f.k == k => f,
         _ => {
-            let beta0 = smart_init_collapsed(&data_null, params.smart_init_regularizer);
-            fit_model(&data_null, &beta0, &vec![params.init_conc; k], params)
+            let beta0 = init_beta(params.init, counts, n, k, &x_null, &data_null, params);
+            fit_model(&data_null, &beta0, &init_conc, params)
         }
     };
 
-    // warm start the full model from the null solution: null rows copied, other rows zero
-    let p_full = x_full.p;
-    let mut beta0 = vec![0.0; p_full * k];
+    // full model from the null solution: null rows copied, group rows zero
+    let mut beta_from_null = vec![0.0; p_full * k];
     for (i, &c) in null_cols.iter().enumerate() {
-        beta0[c * k..(c + 1) * k].copy_from_slice(fit_null.beta_row(i));
+        beta_from_null[c * k..(c + 1) * k].copy_from_slice(fit_null.beta_row(i));
     }
-    let mut fit_full = fit_model(&data_full, &beta0, &fit_null.conc, params);
-    if params.full_extra_starts > 0 {
-        let moved = fit_full
-            .conc
-            .iter()
-            .zip(&fit_null.conc)
-            .map(|(a, b)| (a / b).ln().abs())
-            .fold(0.0, f64::max);
-        if params.restart_conc_ratio <= 1.0 || moved > params.restart_conc_ratio.ln() {
-            // start 1: method-of-moments init of the full design, fresh concentrations
-            let beta_mm = smart_init_collapsed(&data_full, params.smart_init_regularizer);
-            let alt = fit_model(&data_full, &beta_mm, &vec![params.init_conc; k], params);
-            if alt.value > fit_full.value {
-                fit_full = alt;
-            }
-            if params.full_extra_starts > 1 {
-                // start 2: warm start with high concentrations (the near-multinomial mode)
-                let alt = fit_model(&data_full, &beta0, &vec![100.0; k], params);
-                if alt.value > fit_full.value {
-                    fit_full = alt;
-                }
+    let mut smart_init_improved = false;
+    let mut fit_full = match params.procedure {
+        Procedure::Python => {
+            let a = fit_model(&data_full, &beta_from_null, &init_conc, params);
+            let beta_smart = init_beta(params.init, counts, n, k, x_full, &data_full, params);
+            let b = fit_model(&data_full, &beta_smart, &init_conc, params);
+            if b.value > a.value {
+                smart_init_improved = true;
+                b
+            } else {
+                a
             }
         }
-    }
+        Procedure::R => {
+            let mut best = fit_model(&data_full, &beta_from_null, &fit_null.conc, params);
+            if params.full_extra_starts > 0 {
+                let moved = best
+                    .conc
+                    .iter()
+                    .zip(&fit_null.conc)
+                    .map(|(a, b)| (a / b).ln().abs())
+                    .fold(0.0, f64::max);
+                if params.restart_conc_ratio <= 1.0 || moved > params.restart_conc_ratio.ln() {
+                    let beta_mm = smart_init_collapsed(&data_full, params.smart_init_regularizer);
+                    let alt = fit_model(&data_full, &beta_mm, &init_conc, params);
+                    if alt.value > best.value {
+                        smart_init_improved = true;
+                        best = alt;
+                    }
+                    if params.full_extra_starts > 1 {
+                        let alt = fit_model(&data_full, &beta_from_null, &vec![100.0; k], params);
+                        if alt.value > best.value {
+                            best = alt;
+                        }
+                    }
+                }
+            }
+            best
+        }
+    };
+    let _ = &mut fit_full;
 
     let df = (p_full - p_null) * (k - 1);
     let mut loglr = fit_full.value - fit_null.value;
@@ -338,7 +710,11 @@ pub fn lrt(
         for (i, &c) in null_cols.iter().enumerate() {
             beta_n[i * k..(i + 1) * k].copy_from_slice(fit_full.beta_row(c));
         }
-        let refit_null = fit_model(&data_null, &beta_n, &fit_full.conc, params);
+        let conc0 = match params.procedure {
+            Procedure::Python => init_conc.clone(),
+            Procedure::R => fit_full.conc.clone(),
+        };
+        let refit_null = fit_model(&data_null, &beta_n, &conc0, params);
         if refit_null.value > fit_null.value {
             refit = true;
             fit_null = refit_null;
@@ -353,43 +729,59 @@ pub fn lrt(
         fit_null,
         fit_full,
         refit_null: refit,
+        smart_init_improved,
     }
 }
 
-/// Per-intron effect sizes (`leaf_cutter_effect_sizes`): the log effect size is the group
-/// row of `beta`; baseline / perturbed PSI are the concentration-weighted softmax of the
-/// intercept row without / with the group effect.
+/// Per-intron effect sizes for one non-baseline design column (`leaf_cutter_effect_sizes` /
+/// leafcutter-ds `task`): the log effect size is that row of `beta`; `psi` is the
+/// concentration-weighted softmax of the intercept row plus that row; `deltapsi` is the
+/// difference to the baseline PSI (intercept row only).
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct EffectSize {
     pub logef: f64,
-    pub baseline: f64,
-    pub perturbed: f64,
+    pub psi: f64,
     pub deltapsi: f64,
 }
 
-pub fn effect_sizes(fit: &Fit, intercept_row: usize, group_row: usize) -> Vec<EffectSize> {
+/// Concentration-weighted softmax of a logit vector: `normalize(softmax(g) * conc)`.
+pub fn psi_from_logits(g: &[f64], conc: &[f64]) -> Vec<f64> {
+    let m = g.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
+    let mut w: Vec<f64> = g.iter().zip(conc).map(|(v, c)| (v - m).exp() * c).collect();
+    let s: f64 = w.iter().sum();
+    for v in w.iter_mut() {
+        *v /= s;
+    }
+    w
+}
+
+/// Baseline PSI (intercept row) and, per group row, the effect sizes of every intron.
+pub fn effect_sizes(
+    fit: &Fit,
+    intercept_row: usize,
+    group_rows: &[usize],
+) -> (Vec<f64>, Vec<Vec<EffectSize>>) {
     let k = fit.k;
     let b0 = fit.beta_row(intercept_row);
-    let b1 = fit.beta_row(group_row);
-    let to_psi = |g: &[f64]| -> Vec<f64> {
-        let m = g.iter().cloned().fold(f64::NEG_INFINITY, f64::max);
-        let mut w: Vec<f64> = (0..k).map(|j| (g[j] - m).exp() * fit.conc[j]).collect();
-        let s: f64 = w.iter().sum();
-        for v in w.iter_mut() {
-            *v /= s;
-        }
-        w
-    };
-    let base = to_psi(b0);
-    let pert = to_psi(&(0..k).map(|j| b0[j] + b1[j]).collect::<Vec<_>>());
-    (0..k)
-        .map(|j| EffectSize {
-            logef: b1[j],
-            baseline: base[j],
-            perturbed: pert[j],
-            deltapsi: pert[j] - base[j],
+    let base = psi_from_logits(b0, &fit.conc);
+    let per_group = group_rows
+        .iter()
+        .map(|&r| {
+            let b1 = fit.beta_row(r);
+            let pert = psi_from_logits(
+                &(0..k).map(|j| b0[j] + b1[j]).collect::<Vec<_>>(),
+                &fit.conc,
+            );
+            (0..k)
+                .map(|j| EffectSize {
+                    logef: b1[j],
+                    psi: pert[j],
+                    deltapsi: pert[j] - base[j],
+                })
+                .collect()
         })
-        .collect()
+        .collect();
+    (base, per_group)
 }
 
 #[cfg(test)]
@@ -429,6 +821,27 @@ mod tests {
     }
 
     #[test]
+    fn bayesian_ridge_matches_sklearn() {
+        // sklearn.linear_model.BayesianRidge().fit(X, y).coef_ with
+        // X = [[1,0,0.3],[1,0,-1.2],[1,0,0.5],[1,0,0.5],[1,1,2.0],[1,1,-0.7],[1,1,0.3],[1,1,0.1]],
+        // y = [0.2,-0.4,0.1,0.9,1.3,0.5,0.8,1.1]
+        let x = vec![
+            1.0, 0.0, 0.3, 1.0, 0.0, -1.2, 1.0, 0.0, 0.5, 1.0, 0.0, 0.5, 1.0, 1.0, 2.0, 1.0, 1.0,
+            -0.7, 1.0, 1.0, 0.3, 1.0, 1.0, 0.1,
+        ];
+        let y = vec![0.2, -0.4, 0.1, 0.9, 1.3, 0.5, 0.8, 1.1];
+        let c = bayesian_ridge(&x, 8, 3, &y);
+        assert!(
+            c[0].abs() < 1e-12,
+            "intercept column must get a zero coefficient: {c:?}"
+        );
+        let expect = [0.0, 0.48554743, 0.33689104];
+        for i in 1..3 {
+            assert!((c[i] - expect[i]).abs() < 1e-6, "{c:?} vs {expect:?}");
+        }
+    }
+
+    #[test]
     fn lrt_no_signal_has_small_loglr() {
         // same proportions in both groups -> loglr ~ 0, p ~ 1
         let n = 40;
@@ -442,11 +855,13 @@ mod tests {
         }
         let group: Vec<f64> = (0..n).map(|i| if i < n / 2 { 0.0 } else { 1.0 }).collect();
         let x = Design::from_columns(n, &[&vec![1.0; n], &group]);
-        let res = lrt(&counts, n, k, &x, &[0], &FitParams::default(), None);
-        assert_eq!(res.df, 2);
-        assert!(res.loglr.abs() < 1e-3, "loglr={}", res.loglr);
-        assert!(res.p > 0.99);
-        assert!(res.fit_null.converged && res.fit_full.converged);
+        for params in [FitParams::python(), FitParams::r_like()] {
+            let res = lrt(&counts, n, k, &x, &[0], &params, None);
+            assert_eq!(res.df, 2);
+            assert!(res.loglr.abs() < 1e-3, "loglr={}", res.loglr);
+            assert!(res.p > 0.99);
+            assert!(res.fit_null.converged && res.fit_full.converged);
+        }
     }
 
     #[test]
@@ -466,12 +881,17 @@ mod tests {
         }
         let group: Vec<f64> = (0..n).map(|i| if i < n / 2 { 0.0 } else { 1.0 }).collect();
         let x = Design::from_columns(n, &[&vec![1.0; n], &group]);
-        let res = lrt(&counts, n, k, &x, &[0], &FitParams::default(), None);
-        assert!(res.loglr > 50.0, "loglr={}", res.loglr);
-        assert!(res.p < 1e-20);
-        let es = effect_sizes(&res.fit_full, 0, 1);
-        assert!(es[0].deltapsi < -0.4 && es[1].deltapsi > 0.4, "{es:?}");
-        let s: f64 = es.iter().map(|e| e.deltapsi).sum();
-        assert!(s.abs() < 1e-9);
+        for params in [FitParams::python(), FitParams::r_like()] {
+            let res = lrt(&counts, n, k, &x, &[0], &params, None);
+            assert!(res.loglr > 50.0, "loglr={}", res.loglr);
+            assert!(res.p < 1e-20);
+            let (_, es) = effect_sizes(&res.fit_full, 0, &[1]);
+            assert!(
+                es[0][0].deltapsi < -0.4 && es[0][1].deltapsi > 0.4,
+                "{es:?}"
+            );
+            let s: f64 = es[0].iter().map(|e| e.deltapsi).sum();
+            assert!(s.abs() < 1e-9);
+        }
     }
 }

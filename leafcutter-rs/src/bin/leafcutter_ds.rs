@@ -1,6 +1,6 @@
 //! Command line / child-process front end for the LeafCutter differential splicing port.
 //!
-//! * `run`         – the `scripts/leafcutter_ds.R` workflow on a counts file or a count store.
+//! * `run`         – the `leafcutter-ds` workflow on a counts file or a count store.
 //! * `json`        – one request on stdin, one response on stdout (for use as a Node child
 //!   process, e.g. from ProteinPaint).
 //! * `build-store` – convert a counts file into a memory-mapped cluster-major store.
@@ -9,7 +9,9 @@
 use clap::{Args, Parser, Subcommand};
 use leafcutter_rs::design::Design;
 use leafcutter_rs::ds::{self, Cluster, ClusterResult, DsParams};
-use leafcutter_rs::io;
+use leafcutter_rs::fit::{FitParams, InitStrategy};
+use leafcutter_rs::genes::{map_clusters_to_genes, read_exons};
+use leafcutter_rs::io::{self, Phenotype};
 use leafcutter_rs::nullcache::{fingerprint, NullCache};
 use leafcutter_rs::simulate::{simulate, SimParams};
 use leafcutter_rs::store::{build_store, Store};
@@ -23,7 +25,7 @@ use std::time::Instant;
 #[command(
     name = "leafcutter_ds",
     version,
-    about = "LeafCutter differential splicing (Rust port)"
+    about = "LeafCutter differential splicing (Rust port of leafcutter-ds)"
 )]
 struct Cli {
     #[command(subcommand)]
@@ -67,77 +69,79 @@ enum Cmd {
 
 #[derive(Args, Clone)]
 struct FilterArgs {
+    /// Only for categorical phenotypes: the group the others are compared with.
+    #[arg(short = '0', long, default_value = "Control")]
+    baseline_group: String,
     /// Don't test clusters with more introns than this.
-    #[arg(short = 's', long, default_value_t = 10)]
+    #[arg(short = 's', long, default_value_t = usize::MAX)]
     max_cluster_size: usize,
     /// Ignore introns used (>= 1 read) in fewer than this many samples.
     #[arg(short = 'i', long, default_value_t = 5)]
     min_samples_per_intron: usize,
-    /// Require this many samples per group with at least min_coverage reads.
-    #[arg(short = 'g', long, default_value_t = 4)]
+    /// Categorical phenotype: require this many samples per group with at least min_coverage reads.
+    #[arg(short = 'g', long, default_value_t = 3)]
     min_samples_per_group: usize,
     /// Read threshold for min_samples_per_group.
     #[arg(short = 'c', long, default_value_t = 20)]
     min_coverage: u32,
-    /// Maximum L-BFGS iterations per fit.
-    #[arg(long, default_value_t = 2000)]
-    max_iter: usize,
-    /// Extra starting points for the full model (0 reproduces R exactly; more is more robust
-    /// to local optima).
-    #[arg(long, default_value_t = 1)]
-    full_extra_starts: usize,
-    /// Only run extra starts when a concentration moved by more than this factor between the
-    /// null and full fits (1 = always).
-    #[arg(long, default_value_t = 1.0)]
-    restart_conc_ratio: f64,
-    /// L-BFGS relative gradient tolerance (multiplied by machine epsilon; Stan's default 1e7).
-    #[arg(long, default_value_t = 1e4)]
-    tol_rel_grad: f64,
-    /// L-BFGS relative objective tolerance (multiplied by machine epsilon; Stan's default 1e4).
-    #[arg(long, default_value_t = 1e2)]
-    tol_rel_obj: f64,
-    /// L-BFGS history size (Stan's default 5).
-    #[arg(long, default_value_t = 10)]
-    history: usize,
-    /// Reproduce R/rstan's procedure exactly: Stan's stopping rules and a single start.
+    /// Continuous phenotype: require this many distinct values among covered samples.
+    #[arg(short = 'u', long, default_value_t = 10)]
+    min_unique_vals: usize,
+    /// Initialisation: brr (Bayesian ridge regression), rr (ridge regression), mult
+    /// (multinomial logistic regression) or 0.
+    #[arg(long, default_value = "brr")]
+    init: String,
+    /// Reproduce the R package's procedure with rstan's stopping rules and a single start.
     #[arg(long)]
     like_r: bool,
+    /// The R package's procedure with this crate's tighter stopping rules.
+    #[arg(long)]
+    r_procedure: bool,
+    /// Maximum L-BFGS iterations per fit (leafcutter-ds: 500).
+    #[arg(long)]
+    max_iter: Option<usize>,
 }
 
 impl FilterArgs {
-    fn to_params(&self) -> DsParams {
-        let mut p = DsParams {
+    fn to_params(&self) -> Result<DsParams, String> {
+        let mut fit = if self.like_r {
+            FitParams::r_exact()
+        } else if self.r_procedure {
+            FitParams::r_like()
+        } else {
+            FitParams::python()
+        };
+        if !self.like_r && !self.r_procedure {
+            fit.init = self.init.parse::<InitStrategy>()?;
+        }
+        if let Some(m) = self.max_iter {
+            fit.max_iter = m;
+        }
+        Ok(DsParams {
             max_cluster_size: self.max_cluster_size,
             min_samples_per_intron: self.min_samples_per_intron,
             min_samples_per_group: self.min_samples_per_group,
             min_coverage: self.min_coverage,
-            ..Default::default()
-        };
-        p.fit.max_iter = self.max_iter;
-        p.fit.full_extra_starts = self.full_extra_starts;
-        p.fit.restart_conc_ratio = self.restart_conc_ratio;
-        p.fit.lbfgs.tol_rel_grad = self.tol_rel_grad;
-        p.fit.lbfgs.tol_rel_obj = self.tol_rel_obj;
-        p.fit.lbfgs.history = self.history;
-        if self.like_r {
-            p.fit.lbfgs = leafcutter_rs::lbfgs::LbfgsParams::stan();
-            p.fit.full_extra_starts = 0;
-        }
-        p
+            min_unique_vals: self.min_unique_vals,
+            fit,
+        })
     }
 }
 
 #[derive(Args)]
 struct RunArgs {
-    /// Counts file (perind_numers.counts[.gz]) or a count store built with build-store.
+    /// Counts file (perind_numers.counts[.gz] / junction_counts.gz) or a count store built with build-store.
     counts: PathBuf,
-    /// Groups file: sample, group, [confounders...]; no header.
+    /// Groups file: sample, group (labels or numeric), [confounders...]; no header.
     groups: PathBuf,
     #[arg(short = 'o', long, default_value = "leafcutter_ds")]
     output_prefix: String,
     /// Number of threads (0 = all cores).
     #[arg(short = 'p', long, default_value_t = 0)]
     threads: usize,
+    /// Exon table (chr, start, end, strand, gene_name) used only to label clusters with genes.
+    #[arg(short = 'e', long)]
+    exon_file: Option<PathBuf>,
     #[command(flatten)]
     filters: FilterArgs,
     /// Path of a null-fit cache file to read/update.
@@ -164,17 +168,26 @@ struct Request {
     /// Sample names (subset of the cohort), parallel to `groups`.
     #[serde(default)]
     samples: Vec<String>,
-    /// Group label per sample (exactly two distinct labels).
+    /// Group label per sample (any number of labels; all numeric = continuous phenotype).
     #[serde(default)]
     groups: Vec<String>,
     /// Confounder columns, each parallel to `samples`; numeric columns are standardised,
     /// others treated as categorical.
     #[serde(default)]
     confounders: Vec<Vec<String>>,
+    /// Baseline group for categorical phenotypes.
+    #[serde(default = "default_baseline")]
+    baseline_group: String,
+    /// Exon table for gene labels.
+    #[serde(default)]
+    exon_file: Option<PathBuf>,
     #[serde(default)]
     threads: Option<usize>,
     #[serde(default)]
     params: DsParams,
+    /// Use the R package's procedure and rstan's stopping rules.
+    #[serde(default)]
+    like_r: bool,
     #[serde(default)]
     null_cache: Option<PathBuf>,
     /// Drop per-intron effect sizes from the response.
@@ -185,12 +198,21 @@ struct Request {
     only_success: bool,
 }
 
+fn default_baseline() -> String {
+    "Control".into()
+}
+
 #[derive(Serialize)]
 struct Response {
-    group_names: [String; 2],
+    /// Baseline group (categorical) or "mean" (continuous).
+    baseline: String,
+    /// Non-baseline groups, in the order of the effect size columns.
+    groups: Vec<String>,
+    continuous: bool,
     n_samples: usize,
     n_clusters: usize,
     confounder_columns: Vec<String>,
+    dropped_samples: Vec<String>,
     summary: BTreeMap<String, usize>,
     timing_ms: BTreeMap<String, u128>,
     clusters: Vec<ClusterResult>,
@@ -235,72 +257,106 @@ impl Source {
             Source::Store(s) => &s.header.samples,
         }
     }
-    fn n_clusters(&self) -> usize {
-        match self {
-            Source::Table(t) => t.rows.len(), // upper bound; only used for messages
-            Source::Store(s) => s.n_clusters(),
-        }
-    }
 }
 
 struct Analysis {
     results: Vec<ClusterResult>,
-    group_names: [String; 2],
+    baseline: String,
+    groups: Vec<String>,
+    continuous: bool,
     confounder_names: Vec<String>,
+    dropped_samples: Vec<String>,
     n_samples: usize,
-    n_clusters: usize,
     timing: BTreeMap<String, u128>,
+    with_annotations: bool,
 }
 
 fn analyse(
     source: &Source,
     meta: &io::Meta,
+    baseline: &str,
     params: &DsParams,
+    exon_file: Option<&Path>,
     null_cache_path: Option<&Path>,
 ) -> Result<Analysis, String> {
     let mut timing = BTreeMap::new();
     let t0 = Instant::now();
-    let enc = io::encode_design(&meta.groups, &meta.confounders)?;
-    let cols = io::sample_indices(source.samples(), &meta.samples)?;
-    let n = cols.len();
-    let min_group = enc
-        .x
+    let enc = io::encode_design(meta, baseline)?;
+    if !enc.dropped_samples.is_empty() {
+        eprintln!(
+            "Samples removed due to missing values in covariates: {}",
+            enc.dropped_samples.join(",")
+        );
+    }
+    if enc.baseline_missing {
+        if let Phenotype::Categorical { levels, .. } = &enc.phenotype {
+            eprintln!("Warning: baseline group '{baseline}' is not among the group labels; using '{}' as baseline", levels[0]);
+        }
+    }
+    let samples: Vec<String> = enc
+        .sample_rows
         .iter()
-        .filter(|&&v| v == 0.0)
-        .count()
-        .min(enc.x.iter().filter(|&&v| v == 1.0).count());
-    if min_group
-        < params
-            .min_samples_per_intron
-            .max(params.min_samples_per_group)
-    {
-        return Err(format!(
-            "the smallest group has {min_group} samples, fewer than min_samples_per_intron ({}) / min_samples_per_group ({}): no cluster is testable",
-            params.min_samples_per_intron, params.min_samples_per_group
-        ));
+        .map(|&i| meta.samples[i].clone())
+        .collect();
+    let cols = io::sample_indices(source.samples(), &samples)?;
+    let n = cols.len();
+    if let Phenotype::Categorical { levels, codes } = &enc.phenotype {
+        let mut per_level = vec![0usize; levels.len()];
+        for &c in codes {
+            per_level[c] += 1;
+        }
+        let ok1 = per_level
+            .iter()
+            .filter(|&&c| c >= params.min_samples_per_intron)
+            .count();
+        let ok2 = per_level
+            .iter()
+            .filter(|&&c| c >= params.min_samples_per_group)
+            .count();
+        if ok1 < 2 || ok2 < 2 {
+            return Err("There are no groups with enough samples to test. You can reduce min_samples_per_intron (-i) or min_samples_per_group (-g), but note that the calibration of leafcutter p-values has only been checked down to n=4 samples per group.".into());
+        }
     }
     let cache = null_cache_path.map(|p| {
         let key = fingerprint(&(
-            &meta.samples,
+            &samples,
             &meta.confounders,
             params.max_cluster_size,
             params.min_samples_per_intron,
             params.min_coverage,
             params.fit.conc_shape.to_bits(),
             params.fit.conc_rate.to_bits(),
+            params.fit.eps.to_bits(),
+            params.fit.conc_max.to_bits(),
         ));
         NullCache::open(p, key)
     });
     let confounders: Option<&Design> = enc.confounders.as_ref();
+    let exons = match exon_file {
+        Some(p) => Some(read_exons(p)?),
+        None => None,
+    };
     let t1 = Instant::now();
-    let results = match source {
+    let (mut results, with_annotations) = match source {
         Source::Table(table) => {
             let clusters = io::clusters_from_table(table, &cols)?;
             timing.insert("gather_ms".into(), t1.elapsed().as_millis());
             let t2 = Instant::now();
-            let r = ds::run(&clusters, &enc.x, confounders, params, cache.as_ref());
+            let mut r = ds::run(
+                &clusters,
+                &enc.phenotype,
+                confounders,
+                params,
+                cache.as_ref(),
+            );
             timing.insert("fit_ms".into(), t2.elapsed().as_millis());
-            r
+            if let Some(ex) = &exons {
+                let map = map_clusters_to_genes(&clusters, ex);
+                for res in r.iter_mut() {
+                    res.genes = map.get(&res.cluster).cloned();
+                }
+            }
+            (r, clusters.iter().any(|c| !c.annotations.is_empty()))
         }
         Source::Store(store) => {
             use rayon::prelude::*;
@@ -309,26 +365,58 @@ fn analyse(
                 .into_par_iter()
                 .map(|i| {
                     let c: Cluster = store.cluster(i, &cols);
-                    ds::test_cluster(&c, &enc.x, confounders, params, cache.as_ref())
+                    ds::test_cluster(&c, &enc.phenotype, confounders, params, cache.as_ref())
                 })
                 .collect();
             ds::finalize(&mut r);
             timing.insert("fit_ms".into(), t2.elapsed().as_millis());
-            r
+            if let Some(ex) = &exons {
+                // gene labels need only the intron names, which the header carries
+                let shells: Vec<Cluster> = store
+                    .header
+                    .clusters
+                    .iter()
+                    .map(|m| Cluster {
+                        name: m.name.clone(),
+                        introns: m.introns.clone(),
+                        annotations: vec![],
+                        n: 0,
+                        counts: vec![],
+                    })
+                    .collect();
+                let map = map_clusters_to_genes(&shells, ex);
+                for res in r.iter_mut() {
+                    res.genes = map.get(&res.cluster).cloned();
+                }
+            }
+            let ann = store
+                .header
+                .clusters
+                .iter()
+                .any(|m| m.introns.iter().any(|s| s.matches(':').count() >= 4));
+            (r, ann)
         }
     };
+    let _ = &mut results;
     if let Some(c) = &cache {
         c.save()
             .map_err(|e| format!("cannot save null cache: {e}"))?;
     }
     timing.insert("total_ms".into(), t0.elapsed().as_millis());
+    let (baseline_label, continuous) = match &enc.phenotype {
+        Phenotype::Categorical { levels, .. } => (levels[0].clone(), false),
+        Phenotype::Continuous { .. } => (baseline.to_string(), true),
+    };
     Ok(Analysis {
-        n_clusters: results.len(),
         results,
-        group_names: enc.group_names,
+        baseline: baseline_label,
+        groups: enc.phenotype.group_names(),
+        continuous,
         confounder_names: enc.confounder_names,
+        dropped_samples: enc.dropped_samples,
         n_samples: n,
         timing,
+        with_annotations,
     })
 }
 
@@ -338,18 +426,23 @@ fn summary(results: &[ClusterResult]) -> BTreeMap<String, usize> {
 
 fn cmd_run(a: RunArgs) -> Result<(), String> {
     init_threads(a.threads);
-    let params = a.filters.to_params();
+    let params = a.filters.to_params()?;
     eprintln!("Loading counts from {}", a.counts.display());
     let source = Source::open(&a.counts)?;
     eprintln!("Loading metadata from {}", a.groups.display());
     let meta = io::read_groups(&a.groups)?;
-    let enc = io::encode_design(&meta.groups, &meta.confounders)?;
     eprintln!(
-        "Encoding as {} =0, {} =1",
-        enc.group_names[0], enc.group_names[1]
+        "Running differential splicing analysis on {} threads...",
+        rayon::current_num_threads()
     );
-    eprintln!("Running differential splicing analysis on {} samples, up to {} clusters/introns, {} threads...", meta.samples.len(), source.n_clusters(), rayon::current_num_threads());
-    let an = analyse(&source, &meta, &params, a.null_cache.as_deref())?;
+    let an = analyse(
+        &source,
+        &meta,
+        &a.filters.baseline_group,
+        &params,
+        a.exon_file.as_deref(),
+        a.null_cache.as_deref(),
+    )?;
     eprintln!("Differential splicing summary:");
     for (s, c) in ds::status_summary(&an.results) {
         eprintln!("  {c:>8}  {s}");
@@ -357,14 +450,18 @@ fn cmd_run(a: RunArgs) -> Result<(), String> {
     eprintln!("Timing: {:?}", an.timing);
     let sig = PathBuf::from(format!("{}_cluster_significance.txt", a.output_prefix));
     let eff = PathBuf::from(format!("{}_effect_sizes.txt", a.output_prefix));
-    io::write_cluster_table(&sig, &an.results).map_err(|e| e.to_string())?;
-    io::write_effect_sizes(&eff, &an.results, &an.group_names).map_err(|e| e.to_string())?;
+    io::write_cluster_table(&sig, &an.results, an.with_annotations).map_err(|e| e.to_string())?;
+    io::write_effect_sizes(&eff, &an.results, &an.groups, &an.baseline)
+        .map_err(|e| e.to_string())?;
     if a.json {
         let resp = Response {
-            group_names: an.group_names.clone(),
+            baseline: an.baseline.clone(),
+            groups: an.groups.clone(),
+            continuous: an.continuous,
             n_samples: an.n_samples,
-            n_clusters: an.n_clusters,
+            n_clusters: an.results.len(),
             confounder_columns: an.confounder_names.clone(),
+            dropped_samples: an.dropped_samples.clone(),
             summary: summary(&an.results),
             timing_ms: an.timing.clone(),
             clusters: an.results,
@@ -382,8 +479,12 @@ fn cmd_json(default_threads: usize) -> Result<(), String> {
     std::io::stdin()
         .read_to_string(&mut input)
         .map_err(|e| e.to_string())?;
-    let req: Request = serde_json::from_str(&input).map_err(|e| format!("invalid request: {e}"))?;
+    let mut req: Request =
+        serde_json::from_str(&input).map_err(|e| format!("invalid request: {e}"))?;
     init_threads(req.threads.unwrap_or(default_threads));
+    if req.like_r {
+        req.params.fit = FitParams::r_exact();
+    }
     let path = req
         .counts_file
         .as_ref()
@@ -412,8 +513,16 @@ fn cmd_json(default_threads: usize) -> Result<(), String> {
             }
         }
     };
-    let mut an = analyse(&source, &meta, &req.params, req.null_cache.as_deref())?;
+    let mut an = analyse(
+        &source,
+        &meta,
+        &req.baseline_group,
+        &req.params,
+        req.exon_file.as_deref(),
+        req.null_cache.as_deref(),
+    )?;
     let summary = summary(&an.results);
+    let n_clusters = an.results.len();
     if req.only_success {
         an.results.retain(|r| r.is_success());
     }
@@ -423,10 +532,13 @@ fn cmd_json(default_threads: usize) -> Result<(), String> {
         }
     }
     let resp = Response {
-        group_names: an.group_names,
+        baseline: an.baseline,
+        groups: an.groups,
+        continuous: an.continuous,
         n_samples: an.n_samples,
-        n_clusters: an.n_clusters,
+        n_clusters,
         confounder_columns: an.confounder_names,
+        dropped_samples: an.dropped_samples,
         summary,
         timing_ms: an.timing,
         clusters: an.results,
@@ -489,7 +601,6 @@ fn main() {
         Cmd::Json { threads } => {
             let r = cmd_json(threads);
             if let Err(e) = &r {
-                // machine-readable error on stdout for the calling process
                 println!(
                     "{}",
                     serde_json::to_string(&ErrorResponse { error: e.clone() }).unwrap()

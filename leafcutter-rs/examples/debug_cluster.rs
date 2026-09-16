@@ -1,7 +1,7 @@
 //! Trace the null/full fits of one cluster: `cargo run --release --example debug_cluster -- counts groups cluster_name`
 use leafcutter_rs::design::ClusterData;
 use leafcutter_rs::ds::{prepare_cluster, DsParams};
-use leafcutter_rs::fit::{fit_model, smart_init};
+use leafcutter_rs::fit::{fit_model, smart_init_collapsed};
 use leafcutter_rs::io;
 use std::path::Path;
 
@@ -9,7 +9,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let table = io::read_counts(Path::new(&args[1])).unwrap();
     let meta = io::read_groups(Path::new(&args[2])).unwrap();
-    let enc = io::encode_design(&meta.groups, &meta.confounders).unwrap();
+    let enc = io::encode_design(&meta, "control").unwrap();
     let cols = io::sample_indices(&table.samples, &meta.samples).unwrap();
     let clusters = io::clusters_from_table(&table, &cols).unwrap();
     let c = clusters
@@ -18,7 +18,7 @@ fn main() {
         .expect("cluster not found");
     let mut params = DsParams::default();
     params.fit.lbfgs.trace = true;
-    let prep = prepare_cluster(c, &enc.x, enc.confounders.as_ref(), &params).unwrap();
+    let prep = prepare_cluster(c, &enc.phenotype, enc.confounders.as_ref(), &params).unwrap();
     eprintln!(
         "cluster {} n={} k={} p={}",
         c.name, prep.n, prep.k, prep.x_full.p
@@ -30,16 +30,9 @@ fn main() {
             &prep.counts[i * prep.k..(i + 1) * prep.k]
         );
     }
-    let x_null = prep.x_full.select_columns(&prep.null_cols);
-    let dn = ClusterData::build(&prep.counts, prep.n, prep.k, &x_null);
     let df = ClusterData::build(&prep.counts, prep.n, prep.k, &prep.x_full);
-    let b0 = smart_init(
-        &prep.counts,
-        prep.n,
-        prep.k,
-        &x_null,
-        params.fit.smart_init_regularizer,
-    );
+    let dn = df.select_columns(&prep.null_cols);
+    let b0 = smart_init_collapsed(&dn, params.fit.smart_init_regularizer);
     eprintln!("--- null fit");
     let fnull = fit_model(&dn, &b0, &vec![10.0; prep.k], &params.fit);
     eprintln!(
@@ -95,7 +88,10 @@ fn main() {
         let model =
             leafcutter_rs::dm::DmModel::new(&df, params.fit.conc_shape, params.fit.conc_rate);
         let mut theta = beta.clone();
-        theta.extend(conc.iter().map(|c| c.ln()));
+        theta.extend(
+            conc.iter()
+                .map(|&c| params.fit.conc_param().unconstrained(c)),
+        );
         let mut g = vec![0.0; theta.len()];
         let ll = model.log_posterior(&theta, &mut g);
         eprintln!(

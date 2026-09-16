@@ -11,7 +11,7 @@ fn main() {
     let args: Vec<String> = std::env::args().collect();
     let store = Store::open(Path::new(&args[1])).unwrap();
     let meta = io::read_groups(Path::new(&args[2])).unwrap();
-    let enc = io::encode_design(&meta.groups, &meta.confounders).unwrap();
+    let enc = io::encode_design(&meta, "control").unwrap();
     let cols = io::sample_indices(&store.header.samples, &meta.samples).unwrap();
     let m: usize = args.get(3).map(|s| s.parse().unwrap()).unwrap_or(200);
     let mut params = DsParams::default();
@@ -24,7 +24,7 @@ fn main() {
         let c = store.cluster(i, &cols);
         t_gather += t.elapsed().as_secs_f64();
         let t = Instant::now();
-        let prep = match prepare_cluster(&c, &enc.x, None, &params) {
+        let prep = match prepare_cluster(&c, &enc.phenotype, None, &params) {
             Ok(p) => p,
             Err(_) => continue,
         };
@@ -43,7 +43,7 @@ fn main() {
         evals += f.evaluations;
         t_fit1 += t.elapsed().as_secs_f64();
         let t = Instant::now();
-        let r = test_cluster(&c, &enc.x, None, &params, None);
+        let r = test_cluster(&c, &enc.phenotype, None, &params, None);
         t_full += t.elapsed().as_secs_f64();
         let _ = r;
     }

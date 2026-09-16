@@ -1,9 +1,10 @@
-//! Reading LeafCutter count and group files and writing the result tables.
+//! Reading LeafCutter count and group files and writing the result tables in the layout of
+//! leafcutter-ds (`leafcutter/differential_splicing/leafcutter_ds.py`).
 
 use crate::design::Design;
 use crate::ds::{Cluster, ClusterResult};
 use flate2::read::MultiGzDecoder;
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, BufWriter, Read, Write};
 use std::path::Path;
@@ -25,10 +26,11 @@ pub fn open_maybe_gz(path: &Path) -> io::Result<Box<dyn BufRead>> {
 }
 
 /// An intron-by-sample count table as produced by the clustering scripts
-/// (`*_perind_numers.counts.gz`, or `*_perind.counts.gz` whose `a/b` entries are read as `a`).
+/// (`*_perind_numers.counts.gz`, `*.junction_counts.gz`, or `*_perind.counts.gz` whose `a/b`
+/// entries are read as `a`).
 pub struct CountsTable {
     pub samples: Vec<String>,
-    /// (intron name `chr:start:end:clu_id`, counts over samples)
+    /// (intron name `chr:start:end:clu[:annotation]`, counts over samples)
     pub rows: Vec<(String, Vec<u32>)>,
 }
 
@@ -62,8 +64,7 @@ pub fn read_counts(path: &Path) -> Result<CountsTable, String> {
         let vals: Result<Vec<u32>, String> = it.map(parse_count).collect();
         let vals = vals.map_err(|e| format!("line {}: {e}", ln + 2))?;
         if !header_checked {
-            // R's read.table: a header one field shorter than the rows means the first column
-            // holds row names; a header of equal length means it carried a row-name label.
+            // a header one field longer than the data carries a label for the row-name column
             if samples.len() == vals.len() + 1 {
                 samples.remove(0);
             }
@@ -82,19 +83,45 @@ pub fn read_counts(path: &Path) -> Result<CountsTable, String> {
     Ok(CountsTable { samples, rows })
 }
 
-/// Cluster id of an intron name `chr:start:end:clu` is `chr:clu` (as `get_intron_meta`).
-pub fn cluster_id(intron: &str) -> Result<String, String> {
-    let parts: Vec<&str> = intron.split(':').collect();
-    if parts.len() < 4 {
-        return Err(format!(
-            "intron name '{intron}' is not chr:start:end:cluster"
-        ));
-    }
-    Ok(format!("{}:{}", parts[0], parts[parts.len() - 1]))
+/// The fields of an intron name `chr:start:end:clu[:annotation]`.
+pub struct IntronName<'a> {
+    pub chr: &'a str,
+    pub start: u64,
+    pub end: u64,
+    pub clu: &'a str,
+    pub annotation: Option<&'a str>,
 }
 
-/// Group the rows of a count table into clusters, keeping only the given sample columns
-/// (in the given order). Clusters are sorted by name, as R's `table()` does.
+pub fn parse_intron(name: &str) -> Result<IntronName<'_>, String> {
+    let parts: Vec<&str> = name.split(':').collect();
+    if parts.len() < 4 {
+        return Err(format!(
+            "intron name '{name}' is not chr:start:end:cluster[:annotation]"
+        ));
+    }
+    let start = parts[1]
+        .parse::<u64>()
+        .map_err(|_| format!("intron name '{name}': bad start"))?;
+    let end = parts[2]
+        .parse::<u64>()
+        .map_err(|_| format!("intron name '{name}': bad end"))?;
+    Ok(IntronName {
+        chr: parts[0],
+        start,
+        end,
+        clu: parts[3],
+        annotation: parts.get(4).copied(),
+    })
+}
+
+/// Cluster id of an intron: `chr:clu`.
+pub fn cluster_id(intron: &str) -> Result<String, String> {
+    let p = parse_intron(intron)?;
+    Ok(format!("{}:{}", p.chr, p.clu))
+}
+
+/// Group the rows of a count table into clusters, keeping only the given sample columns (in
+/// the given order). Clusters keep their order of first appearance, as leafcutter-ds does.
 pub fn clusters_from_table(
     table: &CountsTable,
     sample_cols: &[usize],
@@ -110,7 +137,6 @@ pub fn clusters_from_table(
             })
             .push(i);
     }
-    order.sort();
     let n = sample_cols.len();
     let mut clusters = Vec::with_capacity(order.len());
     for cid in order {
@@ -118,9 +144,13 @@ pub fn clusters_from_table(
         let k = rows.len();
         let mut counts = vec![0u32; n * k];
         let mut introns = Vec::with_capacity(k);
+        let mut annotations: BTreeSet<String> = BTreeSet::new();
         for (j, &r) in rows.iter().enumerate() {
             let (name, vals) = &table.rows[r];
             introns.push(name.clone());
+            if let Some(a) = parse_intron(name)?.annotation {
+                annotations.insert(a.to_string());
+            }
             for (i, &c) in sample_cols.iter().enumerate() {
                 counts[i * k + j] = vals[c];
             }
@@ -128,6 +158,7 @@ pub fn clusters_from_table(
         clusters.push(Cluster {
             name: cid,
             introns,
+            annotations: annotations.into_iter().collect(),
             n,
             counts,
         });
@@ -178,80 +209,156 @@ pub fn read_groups(path: &Path) -> Result<Meta, String> {
             meta.confounders[c].push(t.to_string());
         }
     }
+    if meta.samples.is_empty() {
+        return Err("groups file is empty".into());
+    }
     Ok(meta)
 }
 
-/// Encoded request design: 0/1 group vector, group names in encoding order, confounder matrix.
+/// The phenotype column of the groups file after encoding.
+#[derive(Clone, Debug)]
+pub enum Phenotype {
+    /// Levels with the baseline first; `codes[i]` indexes `levels`.
+    Categorical {
+        levels: Vec<String>,
+        codes: Vec<usize>,
+    },
+    /// Standardised values (`(x - mean) / sd`, population sd) and the sd used.
+    Continuous { values: Vec<f64>, scale_factor: f64 },
+}
+
+impl Phenotype {
+    pub fn len(&self) -> usize {
+        match self {
+            Phenotype::Categorical { codes, .. } => codes.len(),
+            Phenotype::Continuous { values, .. } => values.len(),
+        }
+    }
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+    /// Names of the non-baseline design columns (the `<group>` in `logef_<group>`).
+    pub fn group_names(&self) -> Vec<String> {
+        match self {
+            Phenotype::Categorical { levels, .. } => levels[1..].to_vec(),
+            Phenotype::Continuous { .. } => vec!["x".to_string()],
+        }
+    }
+    pub fn is_categorical(&self) -> bool {
+        matches!(self, Phenotype::Categorical { .. })
+    }
+}
+
+/// Encoded request design.
 #[derive(Clone, Debug)]
 pub struct EncodedDesign {
-    pub x: Vec<f64>,
-    pub group_names: [String; 2],
+    pub phenotype: Phenotype,
     pub confounders: Option<Design>,
     pub confounder_names: Vec<String>,
+    /// Samples kept (those with complete confounders), by position in the metadata.
+    pub sample_rows: Vec<usize>,
+    /// Samples dropped for missing confounder values.
+    pub dropped_samples: Vec<String>,
+    /// Set when the requested baseline is not one of the group labels (the first level in
+    /// sorted order is used instead).
+    pub baseline_missing: bool,
+}
+
+fn is_missing(s: &str) -> bool {
+    matches!(
+        s,
+        "" | "NA" | "N/A" | "n/a" | "NaN" | "nan" | "NULL" | "null" | "None"
+    )
 }
 
 fn all_numeric(v: &[String]) -> Option<Vec<f64>> {
     v.iter().map(|s| s.parse::<f64>().ok()).collect()
 }
 
-/// Encode groups and confounders exactly as `scripts/leafcutter_ds.R` does: the two group
-/// labels in order of first appearance (sorted if numeric) become 0/1; numeric confounders are
-/// standardised; categorical confounders become one-of-(L-1) indicator columns with
-/// alphabetically sorted levels, the first level being the reference.
-pub fn encode_design(
-    groups: &[String],
-    confounders: &[Vec<String>],
-) -> Result<EncodedDesign, String> {
-    let mut names: Vec<String> = Vec::new();
-    for g in groups {
-        if !names.contains(g) {
-            names.push(g.clone());
-        }
+fn standardise(v: &[f64]) -> (Vec<f64>, f64) {
+    let n = v.len() as f64;
+    let mean = v.iter().sum::<f64>() / n;
+    let sd = (v.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / n).sqrt();
+    (
+        v.iter()
+            .map(|x| if sd > 0.0 { (x - mean) / sd } else { 0.0 })
+            .collect(),
+        sd,
+    )
+}
+
+/// Encode the phenotype and confounders exactly as `leafcutter_ds.py` does: a numeric
+/// phenotype is standardised (continuous); otherwise its labels become ordered levels with
+/// `baseline` first; numeric confounders are standardised (population sd, as
+/// `StandardScaler`), categorical confounders one-hot encoded with the first sorted level
+/// dropped; samples with missing confounder values are removed.
+pub fn encode_design(meta: &Meta, baseline: &str) -> Result<EncodedDesign, String> {
+    // samples with complete confounders
+    let n_all = meta.samples.len();
+    let sample_rows: Vec<usize> = (0..n_all)
+        .filter(|&i| meta.confounders.iter().all(|c| !is_missing(&c[i])))
+        .collect();
+    let dropped_samples: Vec<String> = (0..n_all)
+        .filter(|i| !sample_rows.contains(i))
+        .map(|i| meta.samples[i].clone())
+        .collect();
+    if sample_rows.is_empty() {
+        return Err("no sample has complete confounder values".into());
     }
-    if let Some(nums) = all_numeric(&names) {
-        let mut idx: Vec<usize> = (0..names.len()).collect();
-        idx.sort_by(|&a, &b| nums[a].partial_cmp(&nums[b]).unwrap());
-        names = idx.into_iter().map(|i| names[i].clone()).collect();
-    }
-    if names.len() != 2 {
-        return Err(format!(
-            "expected exactly 2 groups, found {}: {:?}",
-            names.len(),
-            names
-        ));
-    }
-    let x: Vec<f64> = groups
+    let groups: Vec<String> = sample_rows
         .iter()
-        .map(|g| if *g == names[1] { 1.0 } else { 0.0 })
+        .map(|&i| meta.groups[i].clone())
         .collect();
     let n = groups.len();
+
+    let mut baseline_missing = false;
+    let phenotype = if let Some(v) = all_numeric(&groups) {
+        let (values, scale_factor) = standardise(&v);
+        Phenotype::Continuous {
+            values,
+            scale_factor,
+        }
+    } else {
+        let mut levels: Vec<String> = groups
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>()
+            .into_iter()
+            .collect();
+        if let Some(pos) = levels.iter().position(|l| l == baseline) {
+            let b = levels.remove(pos);
+            levels.insert(0, b);
+        } else {
+            baseline_missing = true;
+        }
+        let codes = groups
+            .iter()
+            .map(|g| levels.iter().position(|l| l == g).unwrap())
+            .collect();
+        Phenotype::Categorical { levels, codes }
+    };
+
     let mut cols: Vec<Vec<f64>> = Vec::new();
     let mut col_names: Vec<String> = Vec::new();
-    for (c, col) in confounders.iter().enumerate() {
-        if let Some(v) = all_numeric(col) {
-            let mean = v.iter().sum::<f64>() / n as f64;
-            let sd = if n > 1 {
-                (v.iter().map(|x| (x - mean).powi(2)).sum::<f64>() / (n as f64 - 1.0)).sqrt()
-            } else {
-                0.0
-            };
-            cols.push(
-                v.iter()
-                    .map(|x| if sd > 0.0 { (x - mean) / sd } else { 0.0 })
-                    .collect(),
-            );
-            col_names.push(format!("V{}", c + 3));
+    for (c, col) in meta.confounders.iter().enumerate() {
+        let sub: Vec<String> = sample_rows.iter().map(|&i| col[i].clone()).collect();
+        if let Some(v) = all_numeric(&sub) {
+            cols.push(standardise(&v).0);
+            col_names.push(format!("conf{}", c + 1));
         } else {
-            let mut levels: Vec<String> = col.clone();
-            levels.sort();
-            levels.dedup();
+            let levels: Vec<String> = sub
+                .iter()
+                .cloned()
+                .collect::<BTreeSet<_>>()
+                .into_iter()
+                .collect();
             for lvl in levels.iter().skip(1) {
                 cols.push(
-                    col.iter()
+                    sub.iter()
                         .map(|v| if v == lvl { 1.0 } else { 0.0 })
                         .collect(),
                 );
-                col_names.push(format!("V{}{}", c + 3, lvl));
+                col_names.push(format!("conf{}={}", c + 1, lvl));
             }
         }
     }
@@ -262,10 +369,12 @@ pub fn encode_design(
         Some(Design::from_columns(n, &refs))
     };
     Ok(EncodedDesign {
-        x,
-        group_names: [names[0].clone(), names[1].clone()],
+        phenotype,
         confounders,
         confounder_names: col_names,
+        sample_rows,
+        dropped_samples,
+        baseline_missing,
     })
 }
 
@@ -294,44 +403,81 @@ fn fmt(v: Option<f64>) -> String {
     }
 }
 
-/// `<prefix>_cluster_significance.txt`: cluster, status, loglr, df, p, p.adjust.
-pub fn write_cluster_table(path: &Path, results: &[ClusterResult]) -> io::Result<()> {
+/// `<prefix>_cluster_significance.txt`: cluster, status, loglr, df, p, p.adjust, genes
+/// [, annotations].
+pub fn write_cluster_table(
+    path: &Path,
+    results: &[ClusterResult],
+    with_annotations: bool,
+) -> io::Result<()> {
     let mut w = BufWriter::new(File::create(path)?);
-    writeln!(w, "cluster\tstatus\tloglr\tdf\tp\tp.adjust")?;
+    write!(w, "cluster\tstatus\tloglr\tdf\tp\tp.adjust\tgenes")?;
+    if with_annotations {
+        write!(w, "\tannotations")?;
+    }
+    writeln!(w)?;
     for r in results {
-        writeln!(
+        write!(
             w,
-            "{}\t{}\t{}\t{}\t{}\t{}",
+            "{}\t{}\t{}\t{}\t{}\t{}\t{}",
             r.cluster,
             r.status,
             fmt(r.loglr),
             r.df.map(|d| d.to_string()).unwrap_or_else(|| "NA".into()),
             fmt(r.p),
-            fmt(r.p_adjust)
+            fmt(r.p_adjust),
+            r.genes.as_deref().unwrap_or("NA")
         )?;
+        if with_annotations {
+            write!(
+                w,
+                "\t{}",
+                if r.annotations.is_empty() {
+                    "NA".to_string()
+                } else {
+                    r.annotations.join(",")
+                }
+            )?;
+        }
+        writeln!(w)?;
     }
     w.flush()
 }
 
-/// `<prefix>_effect_sizes.txt`: intron, logef, <group0>, <group1>, deltapsi.
+/// `<prefix>_effect_sizes.txt`: intron, logef_<g>..., psi_<baseline>, psi_<g>..., deltapsi_<g>...
 pub fn write_effect_sizes(
     path: &Path,
     results: &[ClusterResult],
-    group_names: &[String; 2],
+    group_names: &[String],
+    baseline_label: &str,
 ) -> io::Result<()> {
     let mut w = BufWriter::new(File::create(path)?);
-    writeln!(
-        w,
-        "intron\tlogef\t{}\t{}\tdeltapsi",
-        group_names[0], group_names[1]
-    )?;
+    write!(w, "intron")?;
+    for g in group_names {
+        write!(w, "\tlogef_{g}")?;
+    }
+    write!(w, "\tpsi_{baseline_label}")?;
+    for g in group_names {
+        write!(w, "\tpsi_{g}")?;
+    }
+    for g in group_names {
+        write!(w, "\tdeltapsi_{g}")?;
+    }
+    writeln!(w)?;
     for r in results {
         for i in &r.introns {
-            writeln!(
-                w,
-                "{}\t{}\t{}\t{}\t{}",
-                i.intron, i.logef, i.baseline, i.perturbed, i.deltapsi
-            )?;
+            write!(w, "{}", i.intron)?;
+            for g in group_names {
+                write!(w, "\t{}", fmt(i.effects.get(g).map(|e| e.logef)))?;
+            }
+            write!(w, "\t{}", i.psi_baseline)?;
+            for g in group_names {
+                write!(w, "\t{}", fmt(i.effects.get(g).map(|e| e.psi)))?;
+            }
+            for g in group_names {
+                write!(w, "\t{}", fmt(i.effects.get(g).map(|e| e.deltapsi)))?;
+            }
+            writeln!(w)?;
         }
     }
     w.flush()
@@ -366,38 +512,79 @@ pub fn write_counts(path: &Path, samples: &[String], clusters: &[Cluster]) -> io
 mod tests {
     use super::*;
 
-    #[test]
-    fn encode_groups_and_confounders() {
-        let groups: Vec<String> = ["b", "a", "b", "a"].iter().map(|s| s.to_string()).collect();
-        let conf = vec![
-            vec!["1", "2", "3", "4"]
-                .into_iter()
-                .map(String::from)
+    fn meta(groups: &[&str], conf: &[&[&str]]) -> Meta {
+        Meta {
+            samples: (0..groups.len()).map(|i| format!("s{i}")).collect(),
+            groups: groups.iter().map(|s| s.to_string()).collect(),
+            confounders: conf
+                .iter()
+                .map(|c| c.iter().map(|s| s.to_string()).collect())
                 .collect(),
-            vec!["x", "y", "z", "x"]
-                .into_iter()
-                .map(String::from)
-                .collect(),
-        ];
-        let e = encode_design(&groups, &conf).unwrap();
-        assert_eq!(e.group_names, ["b".to_string(), "a".to_string()]);
-        assert_eq!(e.x, vec![0.0, 1.0, 0.0, 1.0]);
-        let d = e.confounders.unwrap();
-        assert_eq!(d.p, 3); // scaled numeric + 2 indicator columns (levels y, z)
-        assert!((d.column_sd(0) - 1.0).abs() < 1e-12);
-        assert_eq!(d.column(1), vec![0.0, 1.0, 0.0, 0.0]);
-        assert_eq!(d.column(2), vec![0.0, 0.0, 1.0, 0.0]);
-        // numeric groups are sorted
-        let groups: Vec<String> = ["1", "0", "1"].iter().map(|s| s.to_string()).collect();
-        let e = encode_design(&groups, &[]).unwrap();
-        assert_eq!(e.x, vec![1.0, 0.0, 1.0]);
+        }
     }
 
     #[test]
-    fn cluster_ids() {
+    fn encode_categorical_with_baseline_and_confounders() {
+        let m = meta(
+            &["b", "a", "c", "a"],
+            &[&["1", "2", "3", "4"], &["x", "y", "z", "x"]],
+        );
+        let e = encode_design(&m, "b").unwrap();
+        match &e.phenotype {
+            Phenotype::Categorical { levels, codes } => {
+                assert_eq!(levels, &["b", "a", "c"]);
+                assert_eq!(codes, &[0, 1, 2, 1]);
+            }
+            _ => panic!(),
+        }
+        assert_eq!(
+            e.phenotype.group_names(),
+            vec!["a".to_string(), "c".to_string()]
+        );
+        let d = e.confounders.unwrap();
+        assert_eq!(d.p, 3);
+        // population sd standardisation
+        let c0 = d.column(0);
+        let mean: f64 = c0.iter().sum::<f64>() / 4.0;
+        let var: f64 = c0.iter().map(|v| (v - mean).powi(2)).sum::<f64>() / 4.0;
+        assert!(mean.abs() < 1e-12 && (var - 1.0).abs() < 1e-12);
+        assert_eq!(d.column(1), vec![0.0, 1.0, 0.0, 0.0]);
+        assert_eq!(d.column(2), vec![0.0, 0.0, 1.0, 0.0]);
+        assert!(!e.baseline_missing);
+        // missing baseline
+        let e = encode_design(&m, "Control").unwrap();
+        assert!(e.baseline_missing);
+    }
+
+    #[test]
+    fn encode_continuous_and_drop_missing() {
+        let m = meta(&["1.5", "2", "3", "10"], &[&["0.1", "NA", "0.3", "0.4"]]);
+        let e = encode_design(&m, "Control").unwrap();
+        assert_eq!(e.dropped_samples, vec!["s1".to_string()]);
+        assert_eq!(e.sample_rows, vec![0, 2, 3]);
+        match &e.phenotype {
+            Phenotype::Continuous {
+                values,
+                scale_factor,
+            } => {
+                assert_eq!(values.len(), 3);
+                assert!((values.iter().sum::<f64>()).abs() < 1e-12);
+                assert!(*scale_factor > 0.0);
+            }
+            _ => panic!(),
+        }
+    }
+
+    #[test]
+    fn intron_names() {
         assert_eq!(
             cluster_id("chr1:100:200:clu_5_NA").unwrap(),
             "chr1:clu_5_NA"
+        );
+        let p = parse_intron("chr10:180128:197910:clu_2_+:NE").unwrap();
+        assert_eq!(
+            (p.chr, p.start, p.end, p.clu, p.annotation),
+            ("chr10", 180128, 197910, "clu_2_+", Some("NE"))
         );
         assert!(cluster_id("bad").is_err());
     }

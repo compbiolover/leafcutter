@@ -62,11 +62,53 @@ impl ShiftWalker {
     }
 }
 
+/// How the concentration parameters are mapped to the unconstrained optimisation variables.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub enum ConcParam {
+    /// `conc = exp(u)` (unbounded, as Stan's `real<lower=0>`).
+    Log,
+    /// `conc = max * sigmoid(u)` (Pyro's `constraints.interval(0, max)`, as leafcutter-ds
+    /// with `conc_max = 3000`).
+    Sigmoid { max: f64 },
+}
+
+impl ConcParam {
+    #[inline]
+    pub fn conc(&self, u: f64) -> f64 {
+        match *self {
+            ConcParam::Log => u.exp(),
+            ConcParam::Sigmoid { max } => max / (1.0 + (-u).exp()),
+        }
+    }
+    #[inline]
+    pub fn unconstrained(&self, conc: f64) -> f64 {
+        match *self {
+            ConcParam::Log => conc.max(1e-300).ln(),
+            ConcParam::Sigmoid { max } => {
+                let p = (conc / max).clamp(1e-12, 1.0 - 1e-12);
+                (p / (1.0 - p)).ln()
+            }
+        }
+    }
+    /// `d conc / d u` divided by `conc`, i.e. the factor turning `∂ℓ/∂log conc` into `∂ℓ/∂u`.
+    #[inline]
+    fn chain(&self, conc: f64) -> f64 {
+        match *self {
+            ConcParam::Log => 1.0,
+            ConcParam::Sigmoid { max } => 1.0 - conc / max,
+        }
+    }
+}
+
 /// The model for one cluster.
 pub struct DmModel<'a> {
     pub data: &'a ClusterData,
     pub conc_shape: f64,
     pub conc_rate: f64,
+    /// Pseudocount added to every Dirichlet parameter (`a = conc * softmax + eps`);
+    /// leafcutter-ds uses 1e-8, the R/Stan model 0.
+    pub eps: f64,
+    pub conc_param: ConcParam,
 }
 
 impl<'a> DmModel<'a> {
@@ -75,6 +117,24 @@ impl<'a> DmModel<'a> {
             data,
             conc_shape,
             conc_rate,
+            eps: 0.0,
+            conc_param: ConcParam::Log,
+        }
+    }
+
+    pub fn with_options(
+        data: &'a ClusterData,
+        conc_shape: f64,
+        conc_rate: f64,
+        eps: f64,
+        conc_param: ConcParam,
+    ) -> Self {
+        DmModel {
+            data,
+            conc_shape,
+            conc_rate,
+            eps,
+            conc_param,
         }
     }
 
@@ -89,19 +149,20 @@ impl<'a> DmModel<'a> {
         let k = self.data.k;
         let p = self.data.p;
         debug_assert_eq!(theta.len(), p * k + k);
-        let (beta, log_conc) = theta.split_at(p * k);
+        let (beta, conc_u) = theta.split_at(p * k);
         for g in grad.iter_mut() {
             *g = 0.0;
         }
         let (grad_beta, grad_lc) = grad.split_at_mut(p * k);
 
-        let mut conc = vec![0.0; k];
+        let mut conc = vec![0.0f64; k];
         for j in 0..k {
-            conc[j] = log_conc[j].exp();
+            conc[j] = self.conc_param.conc(conc_u[j]);
             if !conc[j].is_finite() || conc[j] <= 0.0 {
                 return f64::NEG_INFINITY;
             }
         }
+        let eps = self.eps;
 
         let mut eta = vec![0.0; k];
         let mut s = vec![0.0; k];
@@ -131,11 +192,12 @@ impl<'a> DmModel<'a> {
                 s[j] = (eta[j] - emax).exp();
                 ssum += s[j];
             }
+            // a = conc ⊙ s (+ eps for the lgamma terms; the chain rule uses conc ⊙ s)
             let mut big_a = 0.0;
             for j in 0..k {
                 s[j] /= ssum;
                 a[j] = conc[j] * s[j];
-                big_a += a[j];
+                big_a += a[j] + eps;
             }
             if big_a <= 0.0 || !big_a.is_finite() {
                 return f64::NEG_INFINITY;
@@ -156,7 +218,7 @@ impl<'a> DmModel<'a> {
                 let h = &cell.intron_hist[j];
                 let mut gj = g_a;
                 if !h.is_empty() {
-                    let aj = a[j];
+                    let aj = a[j] + eps;
                     if aj <= 0.0 {
                         return f64::NEG_INFINITY;
                     }
@@ -185,11 +247,13 @@ impl<'a> DmModel<'a> {
             }
         }
 
-        // Gamma(shape, rate) prior on conc, on the log scale (no Jacobian, as rstan::optimizing)
+        // Gamma(shape, rate) prior on conc (no Jacobian: MAP in the constrained space, as both
+        // rstan::optimizing and Pyro's Delta guides), then chain rule to the unconstrained u
         let sm1 = self.conc_shape - 1.0;
         for j in 0..k {
-            ll += sm1 * log_conc[j] - self.conc_rate * conc[j];
+            ll += sm1 * conc[j].ln() - self.conc_rate * conc[j];
             grad_lc[j] += sm1 - self.conc_rate * conc[j];
+            grad_lc[j] *= self.conc_param.chain(conc[j]);
         }
         ll
     }
@@ -226,6 +290,63 @@ impl<'a> DmModel<'a> {
         }
         for j in 0..k {
             ll += (self.conc_shape - 1.0) * log_conc[j] - self.conc_rate * conc[j];
+        }
+        ll
+    }
+}
+
+/// Multinomial logistic regression (the concentration → ∞ limit of the model): used by
+/// leafcutter-ds's `--init mult` initialisation. Parameters are `beta` only (`P x K`).
+pub struct MultinomialModel<'a> {
+    pub data: &'a ClusterData,
+}
+
+impl<'a> MultinomialModel<'a> {
+    pub fn log_likelihood(&self, beta: &[f64], grad: &mut [f64]) -> f64 {
+        let k = self.data.k;
+        let p = self.data.p;
+        for g in grad.iter_mut() {
+            *g = 0.0;
+        }
+        let mut eta = vec![0.0; k];
+        let mut s = vec![0.0; k];
+        let mut ll = 0.0;
+        for cell in &self.data.cells {
+            if cell.n_pos == 0.0 {
+                continue;
+            }
+            let x = &cell.x;
+            let mut emax = f64::NEG_INFINITY;
+            for j in 0..k {
+                let mut e = 0.0;
+                for q in 0..p {
+                    e += beta[q * k + j] * x[q];
+                }
+                eta[j] = e;
+                emax = emax.max(e);
+            }
+            let mut z = 0.0;
+            for j in 0..k {
+                s[j] = (eta[j] - emax).exp();
+                z += s[j];
+            }
+            let lse = emax + z.ln();
+            // Σ_n y_nj = Σ_(v,m) v m ; Y_cell = Σ_(V,M) V M
+            let mut y_tot = 0.0;
+            for &(v, m) in &cell.total_hist {
+                y_tot += v as f64 * m;
+            }
+            for j in 0..k {
+                let mut yj = 0.0;
+                for &(v, m) in &cell.intron_hist[j] {
+                    yj += v as f64 * m;
+                }
+                ll += yj * (eta[j] - lse);
+                let deta = yj - y_tot * s[j] / z;
+                for q in 0..p {
+                    grad[q * k + j] += deta * x[q];
+                }
+            }
         }
         ll
     }
@@ -271,6 +392,55 @@ mod tests {
         let ll = model.log_posterior(&theta, &mut g);
         let ll_dense = model.log_posterior_dense(&theta, &counts, &d);
         assert!((ll - ll_dense).abs() < 1e-9, "{ll} vs {ll_dense}");
+    }
+
+    #[test]
+    fn sigmoid_conc_and_eps_gradient_matches_finite_differences() {
+        let (counts, n, k, d) = toy();
+        let cd = ClusterData::build(&counts, n, k, &d);
+        let model =
+            DmModel::with_options(&cd, 1.0001, 1e-4, 1e-8, ConcParam::Sigmoid { max: 3000.0 });
+        let theta: Vec<f64> = vec![
+            0.3, -0.1, -0.2, 0.5, -0.5, 0.0, 0.1, 0.2, -0.3, -3.0, -4.0, 1.0,
+        ];
+        let mut g = vec![0.0; theta.len()];
+        let _ = model.log_posterior(&theta, &mut g);
+        let mut scratch = vec![0.0; theta.len()];
+        for i in 0..theta.len() {
+            let h = 1e-6;
+            let mut tp = theta.clone();
+            tp[i] += h;
+            let mut tm = theta.clone();
+            tm[i] -= h;
+            let fd = (model.log_posterior(&tp, &mut scratch)
+                - model.log_posterior(&tm, &mut scratch))
+                / (2.0 * h);
+            assert!(
+                (fd - g[i]).abs() < 1e-5 * (1.0 + fd.abs()),
+                "param {i}: fd={fd} analytic={}",
+                g[i]
+            );
+        }
+        // multinomial model gradient
+        let mm = MultinomialModel { data: &cd };
+        let beta: Vec<f64> = theta[..9].to_vec();
+        let mut gb = vec![0.0; 9];
+        let _ = mm.log_likelihood(&beta, &mut gb);
+        let mut sc = vec![0.0; 9];
+        for i in 0..9 {
+            let h = 1e-6;
+            let mut tp = beta.clone();
+            tp[i] += h;
+            let mut tm = beta.clone();
+            tm[i] -= h;
+            let fd =
+                (mm.log_likelihood(&tp, &mut sc) - mm.log_likelihood(&tm, &mut sc)) / (2.0 * h);
+            assert!(
+                (fd - gb[i]).abs() < 1e-5 * (1.0 + fd.abs()),
+                "mult param {i}: fd={fd} analytic={}",
+                gb[i]
+            );
+        }
     }
 
     #[test]

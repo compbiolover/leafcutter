@@ -33,6 +33,15 @@ pub struct LbfgsParams {
     pub max_line_search: usize,
     /// Print one line per iteration to stderr.
     pub trace: bool,
+    /// Use the stopping rules of `torch.optim.LBFGS` (what leafcutter-ds uses) instead of
+    /// Stan's: stop when `max|g| <= tol_grad_inf`, when the directional derivative is above
+    /// `-tol_change`, when `max|step| <= tol_change`, when `|Δf| < tol_change`, or after
+    /// `max_iter` iterations / `1.25 * max_iter` evaluations.
+    pub torch_rules: bool,
+    /// torch `tolerance_grad` (on the max-norm of the gradient).
+    pub tol_grad_inf: f64,
+    /// torch `tolerance_change`.
+    pub tol_change: f64,
 }
 
 impl Default for LbfgsParams {
@@ -47,6 +56,9 @@ impl Default for LbfgsParams {
             tol_param: 1e-8,
             max_line_search: 40,
             trace: false,
+            torch_rules: false,
+            tol_grad_inf: 1e-7,
+            tol_change: 1e-9,
         }
     }
 }
@@ -58,6 +70,19 @@ impl LbfgsParams {
             history: 5,
             tol_rel_obj: 1e4,
             tol_rel_grad: 1e7,
+            ..Default::default()
+        }
+    }
+
+    /// The settings `leafcutter-ds` passes to `torch.optim.LBFGS` (`max_iter = 500`,
+    /// `history_size = 100`, `tolerance_grad = 1e-7`, `tolerance_change = 1e-9`,
+    /// strong-Wolfe line search with at most 25 evaluations).
+    pub fn torch() -> Self {
+        LbfgsParams {
+            history: 100,
+            max_iter: 500,
+            torch_rules: true,
+            max_line_search: 25,
             ..Default::default()
         }
     }
@@ -124,6 +149,21 @@ where
     let mut g_new = vec![0.0; n];
     let mut status = Status::MaxIter;
     let mut iter = 0usize;
+    let max_evals = if params.torch_rules {
+        (params.max_iter as f64 * 1.25) as usize
+    } else {
+        usize::MAX
+    };
+    let inf_norm = |v: &[f64]| v.iter().fold(0.0f64, |m, x| m.max(x.abs()));
+    if params.torch_rules && inf_norm(&g) <= params.tol_grad_inf {
+        return LbfgsResult {
+            f: fx,
+            grad_norm: dot(&g, &g).sqrt(),
+            iterations: 0,
+            evaluations: evals,
+            status: Status::Converged,
+        };
+    }
 
     while iter < params.max_iter {
         // --- search direction: d = -H g via two-loop recursion
@@ -239,6 +279,17 @@ where
         fx = f_new;
         iter += 1;
 
+        if params.torch_rules {
+            if evals >= max_evals
+                || inf_norm(&g) <= params.tol_grad_inf
+                || step * inf_norm(&d) <= params.tol_change
+                || df < params.tol_change
+            {
+                status = Status::Converged;
+                break;
+            }
+            continue;
+        }
         if df < params.tol_obj {
             status = Status::Converged;
             break;

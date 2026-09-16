@@ -1,7 +1,7 @@
 //! End-to-end checks on simulated data: statuses, power, calibration, store round trip,
 //! null-fit cache reuse and JSON serialisation of results.
 
-use leafcutter_rs::ds::{self, DsParams};
+use leafcutter_rs::ds::{self, binary_phenotype, DsParams};
 use leafcutter_rs::nullcache::NullCache;
 use leafcutter_rs::simulate::{simulate, SimParams};
 use leafcutter_rs::store::{write_store, Store};
@@ -18,7 +18,7 @@ fn sim(n: usize, m: usize, seed: u64) -> leafcutter_rs::simulate::SimData {
 #[test]
 fn recovers_simulated_effects_and_is_calibrated() {
     let data = sim(60, 400, 7);
-    let x: Vec<f64> = data.group.iter().map(|&g| g as f64).collect();
+    let x = binary_phenotype(&data.group, "control", "case");
     let params = DsParams::default();
     let results = ds::run(&data.clusters, &x, None, &params, None);
     assert_eq!(results.len(), 400);
@@ -62,7 +62,7 @@ fn recovers_simulated_effects_and_is_calibrated() {
             r.cluster,
             r.loglr.unwrap()
         );
-        let s: f64 = r.introns.iter().map(|i| i.deltapsi).sum();
+        let s: f64 = r.introns.iter().map(|i| i.effects["case"].deltapsi).sum();
         assert!(s.abs() < 1e-8);
     }
 }
@@ -76,7 +76,7 @@ fn store_roundtrip_matches_in_memory_and_supports_subsets() {
     write_store(&data.samples, &data.clusters, &path).unwrap();
     let store = Store::open(&path).unwrap();
     let params = DsParams::default();
-    let x: Vec<f64> = data.group.iter().map(|&g| g as f64).collect();
+    let x = binary_phenotype(&data.group, "control", "case");
     let all: Vec<usize> = (0..40).collect();
     for i in 0..store.n_clusters() {
         let c = store.cluster(i, &all);
@@ -105,7 +105,7 @@ fn store_roundtrip_matches_in_memory_and_supports_subsets() {
 #[test]
 fn null_cache_is_reused_and_gives_identical_results() {
     let data = sim(50, 60, 11);
-    let x: Vec<f64> = data.group.iter().map(|&g| g as f64).collect();
+    let x = binary_phenotype(&data.group, "control", "case");
     let params = DsParams::default();
     let cache = NullCache::in_memory(42);
     let first = ds::run(&data.clusters, &x, None, &params, Some(&cache));
@@ -130,7 +130,8 @@ fn null_cache_is_reused_and_gives_identical_results() {
         assert_eq!(a.loglr, b.loglr, "{}", a.cluster);
     }
     // a different grouping reuses the same null fits
-    let x2: Vec<f64> = (0..50).map(|i| if i % 4 < 2 { 0.0 } else { 1.0 }).collect();
+    let g2: Vec<u8> = (0..50).map(|i| if i % 4 < 2 { 0 } else { 1 }).collect();
+    let x2 = binary_phenotype(&g2, "control", "case");
     let third = ds::run(&data.clusters, &x2, None, &params, Some(&cache));
     assert_eq!(cache.len(), n_cached);
     assert!(third.iter().any(|r| r.is_success()));
@@ -143,7 +144,7 @@ fn null_cache_is_reused_and_gives_identical_results() {
 #[test]
 fn results_serialise_to_json() {
     let data = sim(30, 5, 5);
-    let x: Vec<f64> = data.group.iter().map(|&g| g as f64).collect();
+    let x = binary_phenotype(&data.group, "control", "case");
     let results = ds::run(&data.clusters, &x, None, &DsParams::default(), None);
     let s = serde_json::to_string(&results).unwrap();
     let back: Vec<ds::ClusterResult> = serde_json::from_str(&s).unwrap();
