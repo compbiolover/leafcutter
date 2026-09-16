@@ -152,24 +152,55 @@ sample subset and labels, and reuse `null_cache` for requests that regroup the s
 
 ## Validation
 
-R/rstan is not needed for the tests, but `scripts/reference_ds.py` is an independent
-implementation in numpy/autograd/scipy that uses *Stan's own parameterisation*, the R
-package's smart initialisation and refit rule, and a different optimiser (scipy L-BFGS-B with
-very tight tolerances). On simulated data (300 clusters at N = 100, 150 clusters at N = 400):
+### Against the R package
 
-* every skip reason agrees, and the significant sets at p < 0.05, 0.001 and 1e-6 are identical;
-* with the default settings the median |Δ log LR| is 1e-4 (N = 100) and 3e-4 (N = 400), and the
-  Rust fit reaches a higher posterior than the reference in most clusters (243/300 and
-  120/150). The remaining disagreements are clusters where the two optimisers settle in
-  different posterior modes: a few very significant clusters whose log LR differs by tens (p
-  of 1e-77 vs 1e-58) and a few non-significant ones (e.g. p 0.42 vs 0.14);
-* with `--like-r` the median |Δ log LR| is 2e-3 (N = 100) and 2e-2 (N = 400), and the reference
-  is usually slightly higher: that is the early stopping of Stan's default tolerances, which
-  R inherits.
+`scripts/run_r_reference.R` runs the R package's own test (it sources `leafcutter/R` and
+compiles `inst/stan/dm_glm_multi_conc.stan` with rstan; only rstan, foreach, doMC, dplyr and
+R.utils are needed) and `scripts/r_to_reference_json.py` converts its output for
+`compare_reference.py`. On the simulated datasets, all 2 000 clusters:
+
+| samples | skip reasons | significant set p < 1e-6 / 1e-3 | p < 0.05 disagreements | median Δ log LR (default / `--like-r`) | R time (4 thr.) | Rust time (4 thr., default / `--like-r`) |
+|--------:|:------------:|:-------------------------------:|:----------------------:|:--------------------------------------:|----------------:|-----------------------------------------:|
+|     100 | identical    | identical / identical           | 11 of 2 000            | 7e-3 / 3e-3                            |          23 s   | 0.87 s / 0.23 s                          |
+|     400 | identical    | identical / identical           | 14                     | 4e-2 / 4e-3                            |          45 s   | 0.95 s / 0.22 s                          |
+|   1 000 | identical    | identical / 2 differ            | 27                     | 9e-2 / 4e-3                            |          78 s   | 1.2 s / 0.21 s                           |
+
+The null fits agree with R to ~1e-5 in log posterior. Every disagreement is a cluster where
+the Rust full fit reached a *higher* posterior than rstan's (all 11 + 14 + 27, and with the
+defaults Rust's full fit is lower than R's by more than 1e-3 in only 7–10 clusters per
+dataset): `rstan::optimizing` stops early in the flat concentration directions, increasingly
+so with N (median full-fit deficit 7e-3 at N = 100, 9e-2 at N = 1 000). So the port
+reproduces R's procedure (`--like-r`: median Δ log LR 3e-3 to 4e-3) and, by default, the
+statistic R's procedure is trying to compute. Both R and the independent Python reference
+below were run on the same files; the Python reference also lands above R in every cluster
+where they differ by more than 0.1.
+
+To reproduce (a conda-forge environment avoids compiling rstan; two quirks: recent stanc no
+longer accepts the package's old array syntax, which the script rewrites on the fly, and
+oneTBB needs `-DTBB_INTERFACE_NEW` in `~/.R/Makevars` `CXX17FLAGS`):
 
 ```
+micromamba create -n r -c conda-forge r-base r-rstan r-bh r-rcppeigen r-rcppparallel gxx_linux-64 make \
+    r-foreach r-domc r-dplyr r-r.utils r-optparse r-magrittr
 leafcutter_ds simulate -n 100 -m 2000 -o sim
 leafcutter_ds run sim_perind_numers.counts.gz sim_groups.txt -o rust --json
+micromamba run -n r Rscript scripts/run_r_reference.R sim_perind_numers.counts.gz sim_groups.txt r_out 0 4
+python3 scripts/r_to_reference_json.py r_out r.json
+python3 scripts/compare_reference.py rust_results.json r.json
+```
+
+### Against an independent Python implementation
+
+`scripts/reference_ds.py` is an independent implementation in numpy/autograd/scipy that uses
+*Stan's own parameterisation*, the R package's smart initialisation and refit rule, and a
+different optimiser (scipy L-BFGS-B with very tight tolerances). On 300 clusters at N = 100
+and 150 clusters at N = 400: every skip reason agrees, the significant sets at p < 0.05,
+0.001 and 1e-6 are identical, and with the default settings the median |Δ log LR| is 1e-4 to
+3e-4; the Rust fit reaches a higher posterior than the reference in most clusters (243/300
+and 120/150). The remaining disagreements are clusters where the two optimisers settle in
+different posterior modes.
+
+```
 python3 scripts/reference_ds.py sim_perind_numers.counts.gz sim_groups.txt --out ref.json --max-clusters 300
 python3 scripts/compare_reference.py rust_results.json ref.json
 ```
@@ -194,5 +225,6 @@ src/simulate.rs  synthetic data
 src/bin/leafcutter_ds.rs   CLI + JSON protocol
 examples/debug_cluster.rs  trace the fits of one cluster
 examples/profile_setup.rs  per-phase timing of one cluster
-scripts/reference_ds.py    independent Python reference, compare_reference.py
+scripts/reference_ds.py    independent Python reference; compare_reference.py
+scripts/run_r_reference.R  run the R package's test; r_to_reference_json.py
 ```
