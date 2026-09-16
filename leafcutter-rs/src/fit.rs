@@ -436,8 +436,8 @@ mod tests {
         let mut counts = Vec::new();
         for i in 0..n {
             let base = [20u32, 10, 5];
-            for j in 0..k {
-                counts.push(base[j] + (i % 3) as u32);
+            for b in base.iter().take(k) {
+                counts.push(b + (i % 3) as u32);
             }
         }
         let group: Vec<f64> = (0..n).map(|i| if i < n / 2 { 0.0 } else { 1.0 }).collect();
@@ -460,8 +460,8 @@ mod tests {
             } else {
                 [5u32, 30, 5]
             };
-            for j in 0..k {
-                counts.push(base[j] + (i % 2) as u32);
+            for b in base.iter().take(k) {
+                counts.push(b + (i % 2) as u32);
             }
         }
         let group: Vec<f64> = (0..n).map(|i| if i < n / 2 { 0.0 } else { 1.0 }).collect();
