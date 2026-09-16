@@ -186,7 +186,10 @@ leafcutter-ds and on simulated data, with identical options:
 The disagreements are clusters where the Python fits stopped early: after removing Pyro's
 Gamma normalising constant, the Rust null and full log posteriors are higher than Python's
 in 212 and 203 of the 254 tested Geuvadis clusters (by more than 0.1 in 89 and 70) and lower
-by more than 1e-3 in only 11 and 20, never by more than 0.1. Effect sizes: PSI and ΔPSI agree
+by more than 1e-3 in only 11 and 20, never by more than 0.1. On the N = 400 simulation the
+Rust full fit is higher in 1 688 of 2 000 clusters (by more than 0.1 in 870) and higher in
+every one of the 40 clusters where the p < 0.05 call differs; the null fits differ by a
+median of 2e-3, below the resolution of Python's float32 objective. Effect sizes: PSI and ΔPSI agree
 to a median of ~1e-4 (max 4e-3 on the leafcutter2 example); `logef` differs by more than
 0.01 for introns whose usage is absent in one group, where the coefficient drifts towards
 −∞ and both implementations stop at an arbitrary point.
