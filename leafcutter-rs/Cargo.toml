@@ -1,0 +1,33 @@
+[package]
+name = "leafcutter_rs"
+version = "0.1.0"
+edition = "2021"
+description = "Rust port of LeafCutter's Dirichlet-multinomial differential splicing test"
+license = "GPL-3.0-or-later"
+
+[lib]
+name = "leafcutter_rs"
+path = "src/lib.rs"
+
+[[bin]]
+name = "leafcutter_ds"
+path = "src/bin/leafcutter_ds.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+flate2 = "1"
+libm = "0.2"
+memmap2 = "0.9"
+rayon = "1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+debug = false
+panic = "unwind"
+
+[profile.bench]
+inherits = "release"
